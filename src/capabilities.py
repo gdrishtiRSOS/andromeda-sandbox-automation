@@ -47,7 +47,7 @@ __all__ = [
     "CapabilityWriteError",
 ]
 
-STANDARD_PATH = Path(__file__).parent / "data" / "boiler911_capabilities.json"
+STANDARD_PATH = Path(__file__).parent / "data" / "standard_capabilities.json"
 
 # Alerts cannot be enabled where the authority's jurisdiction overlaps another
 # that already has them. Andromeda returns a 500 rather than a validation

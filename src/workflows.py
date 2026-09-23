@@ -6,6 +6,10 @@ jurisdiction that is never published does nothing.
 
 The modules stay independent -- `jurisdictions` and `revisions` know nothing
 of each other -- and this is where they are combined.
+
+`create_sandbox_account` is the top of the stack: a typed place name in, a
+configured sandbox account out. It is the only place that knows the runbook's
+steps belong in one sequence.
 """
 
 from __future__ import annotations
@@ -58,9 +62,11 @@ __all__ = [
     "PartialActivationError",
     "PartialProvisionError",
     "ProvisionResult",
+    "SandboxAccount",
     "WorkflowClient",
     "attach_and_activate",
     "confirm_jurisdiction_active",
+    "create_sandbox_account",
     "provision_authority",
 ]
 
@@ -435,3 +441,103 @@ def provision_authority(
 
     log.info("provisioning complete: %s", result.summary())
     return result
+
+
+# --------------------------------------------------- place -> sandbox account
+
+
+@dataclass
+class SandboxAccount:
+    """What a single "create me an account for X" request produced."""
+
+    query: str
+    place: Any                                   # places.ResolvedPlace
+    fields: dict[str, Any]
+    authority_id: str | None = None
+    provision: ProvisionResult | None = None
+
+    @property
+    def created_authority(self) -> bool:
+        return self.authority_id is not None
+
+    def summary(self) -> str:
+        head = f"{self.query!r} -> {self.place}"
+        if self.provision is None:
+            return f"{head} (nothing provisioned)"
+        return f"{head}\n  {self.provision.summary()}"
+
+
+def create_sandbox_account(
+    client: WorkflowClient,
+    query: str,
+    *,
+    authority: str,
+    account_id: str | None = None,
+    name_template: str | None = None,
+    use_ecc_name: bool = False,
+    require_status: bool = True,
+    update_account_info_first: bool = True,
+    dispatch_type: int | None = None,
+    counties: Any = None,
+    places_table: Any = None,
+    **provision_kwargs: Any,
+) -> SandboxAccount:
+    """Create a sandbox account for a named place.
+
+    `query` is what a person typed -- "Lincoln, Nebraska", "Washington
+    County, TX", or a 5-digit county GEOID. It resolves to a county boundary,
+    which drives everything else: the Account Info state, the generated
+    account_id, and the jurisdiction polygon.
+
+    `authority` is the existing authority to configure, by name or numeric id.
+    The signup wizard (runbook step 1) is not yet automated, so the authority
+    must already exist.
+
+    Everything else follows `provision_authority`: boundary, revision,
+    integration, capabilities.
+
+    Raises
+    ------
+    PlaceError and subclasses
+        The query could not be resolved to exactly one county.
+    PartialProvisionError
+        A step failed; the error carries what completed.
+    """
+    # imported here: geopandas is only needed when a place is actually resolved
+    from andromeda.places import account_fields, resolve_place, to_andromeda_polygon
+    from andromeda.authorities import resolve_authority_id, update_account_info
+
+    place = resolve_place(
+        query, require_status=require_status, counties=counties, places=places_table
+    )
+    log.info("resolved %r to %s", query, place)
+
+    field_kwargs: dict[str, Any] = {"use_ecc_name": use_ecc_name}
+    if name_template:
+        field_kwargs["name_template"] = name_template
+    fields = account_fields(place, **field_kwargs)
+    if account_id:
+        fields["account_id"] = account_id
+
+    authority_id = resolve_authority_id(client, authority)
+    account = SandboxAccount(query=query, place=place, fields=fields,
+                             authority_id=authority_id)
+
+    dry_run = provision_kwargs.get("dry_run", False)
+
+    if update_account_info_first:
+        report = update_account_info(
+            client, authority_id,
+            account_id=fields["account_id"],
+            country=fields["country"],
+            state=fields["state"],
+            dispatch_type=dispatch_type,
+            dry_run=dry_run,
+        )
+        log.info("account info: %s", report.summary())
+
+    polygon = to_andromeda_polygon(place)
+    account.provision = provision_authority(
+        client, authority_id, polygon=polygon, **provision_kwargs
+    )
+    return account

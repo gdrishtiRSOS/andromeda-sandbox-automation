@@ -34,6 +34,29 @@ Stages
     --stage create                 dry run
     --stage create --apply         create it
 
+  Place -> sandbox account (the whole thing)
+    --stage place   --place "Lincoln, Nebraska"         resolve only, no writes
+    --stage sandbox --place "Lincoln, Nebraska" --authority-id gDTest
+    ... add --apply to write
+
+    The authority must already exist -- the signup wizard is not automated
+    yet. Everything else is derived from the place.
+
+  Role and Access (runbook step 8)
+    Runs against the PORTAL API, which uses its own token:
+      $env:RAPIDSOS_PORTAL_TOKEN='<from api-sandbox.rapidsosportal.com>'
+
+    --stage roles                                   dry run, snapshots first
+    --stage roles --apply                           grant all data sources
+    --stage roles --restore-roles <file> --apply    undo
+
+  Account Info (runbook step 2)
+    --stage catalogs                       list country codes
+    --stage catalogs --country IRL         list that country's regions
+    --stage account-info                   show the current values
+    --stage account-info --account-id GD_0209 --country IRL --state LK
+    ... add --apply to write
+
   Everything (runbook steps 4, 7, 5, 6)
     --stage provision --geojson dublin                  dry run
     --stage provision --geojson dublin --apply          boundary, activate,
@@ -55,6 +78,10 @@ Stages
     --stage activate --apply       create + publish the revision
 
   --stage pending and --stage activate do not need --integration-id.
+
+  --authority-id takes a name as well as a number: pass "gDTest" and it is
+  looked up. Names are matched exactly (case-insensitively); a duplicate name
+  is refused rather than guessed at.
 """
 
 from __future__ import annotations
@@ -72,6 +99,18 @@ try:
 except ImportError:
     sys.exit("needs requests:  pip install requests")
 
+from andromeda.authorities import (
+    AccountInfoError,
+    AmbiguousAuthorityError,
+    AuthorityNotFoundError,
+    UnknownCountryError,
+    UnknownStateError,
+    get_authority,
+    list_countries,
+    list_states,
+    resolve_authority_id,
+    update_account_info,
+)
 from andromeda.capabilities import (
     CapabilityWriteError,
     apply_standard_capabilities,
@@ -95,6 +134,16 @@ from andromeda.jurisdictions import (
     list_jurisdictions,
     load_geojson,
 )
+from andromeda.roles import (
+    RoleError,
+    RoleNotFoundError,
+    RoleWriteError,
+    enable_all_data_sources,
+    list_permissions,
+    list_roles,
+    restore_roles,
+    snapshot_roles,
+)
 from andromeda.revisions import (
     RevisionError,
     activate_jurisdiction,
@@ -106,10 +155,12 @@ from andromeda.workflows import (
     PartialActivationError,
     PartialProvisionError,
     attach_and_activate,
+    create_sandbox_account,
     provision_authority,
 )
 
 DEFAULT_BASE = "https://andromeda.sandbox.rapidsos.com"
+PORTAL_BASE = "https://api-sandbox.rapidsosportal.com"
 DEFAULT_ORG = "RapidSOS Admin"
 
 
@@ -162,6 +213,9 @@ class SimpleClient:
 
     def patch(self, path: str, json):
         return self._call("PATCH", path, json=json)
+
+    def put(self, path: str, json):
+        return self._call("PUT", path, json=json)
 
     # not part of the protocol -- only used to create a scratch integration
     def post(self, path: str, json):
@@ -259,12 +313,16 @@ def inspect_token(token: str | None) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--authority-id", required=True)
+    p.add_argument("--authority-id", required=True,
+                   help="the numeric id, or the authority's name "
+                        "(looked up automatically)")
     p.add_argument("--integration-id", help="omit with --stage scratch to create one")
     p.add_argument("--standard", default="andromeda/data/standard_capabilities.json")
     p.add_argument("--stage",
                    choices=["read", "plan", "apply", "verify", "create", "scratch",
-                            "pending", "activate", "jurisdiction", "provision"],
+                            "pending", "activate", "jurisdiction", "provision",
+                            "account-info", "catalogs", "place", "sandbox",
+                            "roles"],
                    default="read", help="'scratch' is an alias for 'create'")
     p.add_argument("--revision-number", type=int,
                    help="override the generated revision number (default: day + month)")
@@ -272,6 +330,20 @@ def main() -> int:
     p.add_argument("--geojson",
                    help="boundary for --stage jurisdiction: a name in andromeda/data/ "
                         "(with or without .geojson) or a full path")
+    p.add_argument("--organization-id",
+                   help="portal org id for --stage roles; derived from the "
+                        "authority when omitted")
+    p.add_argument("--portal-base-url", default=PORTAL_BASE)
+    p.add_argument("--restore-roles", help="a role snapshot JSON file to write back")
+    p.add_argument("--place", help='what to create, e.g. "Lincoln, Nebraska" or 48477')
+    p.add_argument("--use-ecc-name", action="store_true",
+                   help="name the authority after the registered ECC")
+    p.add_argument("--allow-unverified-scope", action="store_true",
+                   help="proceed even when the FCC registry lists no ECCs")
+    p.add_argument("--account-id", help="free-text Account ID, e.g. GD_0209")
+    p.add_argument("--country", help="country code, e.g. IRL or USA")
+    p.add_argument("--state", help="state/region code, e.g. LK or TX")
+    p.add_argument("--dispatch-type", type=int)
     p.add_argument("--skip-jurisdiction", action="store_true",
                    help="--stage provision: the boundary is already live")
     p.add_argument("--require-active", action="store_true",
@@ -311,6 +383,18 @@ def main() -> int:
         os.environ.get("ANDROMEDA_COOKIE"), args.header, token,
     )
 
+    if not str(args.authority_id).strip().isdigit():
+        wanted = args.authority_id
+        try:
+            args.authority_id = resolve_authority_id(client, wanted)
+        except (AuthorityNotFoundError, AmbiguousAuthorityError) as exc:
+            print(f"{type(exc).__name__}: {exc}")
+            return 1
+        except ApiError as exc:
+            print(f"API ERROR while looking up {wanted!r}: {exc}")
+            return 1
+        print(f"authority : {wanted!r} -> id {args.authority_id}\n")
+
     # ---------------------------------------------------------- create
     if args.stage in ("create", "scratch"):
         try:
@@ -344,9 +428,244 @@ def main() -> int:
         print(f"\nnext:  --integration-id {integration.id} --stage plan")
         return 0
 
-    if args.stage not in ("pending", "activate", "jurisdiction", "provision") \
-            and not args.integration_id:
+    if args.stage not in ("pending", "activate", "jurisdiction", "provision",
+                          "account-info", "catalogs", "place", "sandbox",
+                          "roles") and not args.integration_id:
         sys.exit("--integration-id is required for this stage")
+
+    # ----------------------------------------------------------- catalogs
+    if args.stage == "catalogs":
+        try:
+            countries = list_countries(client)
+        except ApiError as exc:
+            print(f"\nAPI ERROR: {exc}")
+            return 1
+        print(f"countries ({len(countries)}):")
+        for code, name in sorted(countries.items()):
+            print(f"  {code:6} {name}")
+        if args.country:
+            states = list_states(client, args.country)
+            print(f"\nstates/regions in {args.country} ({len(states)}):")
+            for code, name in sorted(states.items()):
+                print(f"  {code:6} {name}")
+        else:
+            print("\npass --country CODE to list its states/regions")
+        return 0
+
+    # ------------------------------------------------------- account-info
+    if args.stage == "account-info":
+        try:
+            current = get_authority(client, args.authority_id)
+        except ApiError as exc:
+            print(f"\nAPI ERROR: {exc}")
+            return 1
+        attrs = current.get("attributes") or {}
+        print(f"authority   : {current.get('name')} (id {current.get('id')})")
+        print(f"account_id  : {current.get('account_id')!r}")
+        print(f"dispatch    : {current.get('dispatch_type')!r}")
+        print(f"country     : {attrs.get('country')!r}")
+        print(f"state       : {attrs.get('state')!r}")
+        print(f"org id      : {current.get('organization_id')}")
+        print()
+
+        if not any([args.account_id, args.country, args.state,
+                    args.dispatch_type is not None]):
+            print("nothing to change. Pass --account-id / --country / --state / "
+                  "--dispatch-type.")
+            print("Use --stage catalogs to see valid country and state codes.")
+            return 0
+
+        try:
+            report = update_account_info(
+                client, args.authority_id,
+                account_id=args.account_id,
+                country=args.country,
+                state=args.state,
+                dispatch_type=args.dispatch_type,
+                dry_run=not args.apply,
+            )
+        except (UnknownCountryError, UnknownStateError) as exc:
+            print(f"{type(exc).__name__}: {exc}")
+            return 1
+        except AccountInfoError as exc:
+            print(f"AccountInfoError: {exc}")
+            return 1
+        except ApiError as exc:
+            print(f"\nAPI ERROR: {exc}")
+            return 1
+
+        for name, (before, after) in sorted(report.changed.items()):
+            print(f"  {name}: {before!r} -> {after!r}")
+        for name, reason in sorted(report.skipped.items()):
+            print(f"  {name}: SKIPPED -- {reason}")
+        if report.is_noop:
+            print("already up to date; nothing sent.")
+            return 0
+        if not args.apply:
+            print("\n[dry-run] nothing sent. Re-run with --apply.")
+            return 0
+        print(f"\n{report.summary()}")
+        return 0
+
+    # -------------------------------------------------------------- roles
+    if args.stage == "roles":
+        portal_token = os.environ.get("RAPIDSOS_PORTAL_TOKEN")
+        if not portal_token:
+            sys.exit(
+                "--stage roles needs RAPIDSOS_PORTAL_TOKEN.\n"
+                "The portal API uses a DIFFERENT token from Andromeda. Copy it\n"
+                "from a request to api-sandbox.rapidsosportal.com:\n"
+                "  $env:RAPIDSOS_PORTAL_TOKEN='<token>'"
+            )
+        print("portal    : " + args.portal_base_url)
+        inspect_token(portal_token)
+        print()
+
+        portal = SimpleClient(args.portal_base_url, args.org, None, [], portal_token)
+
+        org_id = args.organization_id
+        if not org_id:
+            try:
+                record = get_authority(client, args.authority_id)
+            except ApiError as exc:
+                print(f"API ERROR reading the authority: {exc}")
+                return 1
+            org_id = str(record.get("organization_id") or "")
+            if not org_id:
+                sys.exit("the authority has no organization_id; pass --organization-id")
+            print(f"authority {args.authority_id} -> organization {org_id}\n")
+
+        try:
+            if args.restore_roles:
+                snap = json.loads(Path(args.restore_roles).read_text())
+                print(f"restoring from {args.restore_roles}")
+                for saved in snap.get("roles", []):
+                    print(f"  {saved['name']}: {len(saved['permissions'])} permission(s)")
+                if not args.apply:
+                    print("\n[dry-run] nothing sent. Re-run with --apply.")
+                    return 0
+                report = restore_roles(portal, snap, organization_id=org_id)
+                print(f"\n{report.summary()}")
+                return 0
+
+            catalog = list_permissions(portal, org_id)
+            roles = list_roles(portal, org_id)
+            print(f"catalog   : {len(catalog)} permission(s), "
+                  f"{sum(1 for p in catalog if p.get('rsp_rbac'))} administrative")
+            print("roles     :")
+            for role in roles:
+                print(f"  {role}")
+
+            snap = snapshot_roles(portal, org_id)
+            snap_path = snapshot(snap, f"roles-{org_id}", "before", args.snapshot_dir)
+            print(f"snapshot  : {snap_path}")
+            print()
+
+            report = enable_all_data_sources(portal, org_id, dry_run=not args.apply)
+        except (RoleNotFoundError, RoleWriteError, RoleError) as exc:
+            print(f"{type(exc).__name__}: {exc}")
+            return 1
+        except ApiError as exc:
+            print(f"API ERROR: {exc}")
+            return 1
+
+        for role, names in sorted(report.granted.items()):
+            print(f"  {role}: +{len(names)}  {', '.join(names[:6])}"
+                  + (" ..." if len(names) > 6 else ""))
+        for role, names in sorted(report.revoked.items()):
+            print(f"  {role}: -{len(names)}  {', '.join(names)}")
+            print("    !! these would be REMOVED. Stop and check why the role has them.")
+        for role in report.unchanged:
+            print(f"  {role}: already correct")
+
+        print(f"\n{report.summary()}")
+        if not args.apply:
+            print("[dry-run] nothing sent. Re-run with --apply.")
+        else:
+            print(f"undo with:  --stage roles --restore-roles {snap_path} --apply")
+            print("Then check the portal: Admin -> Role and Access, and that the "
+                  "Alerts tab appears.")
+        return 0
+
+    # -------------------------------------------------------------- place
+    if args.stage in ("place", "sandbox"):
+        if not args.place:
+            sys.exit('--stage %s needs --place, e.g. --place "Lincoln, Nebraska"'
+                     % args.stage)
+        try:
+            from andromeda.places import (
+                PlaceError, account_fields, resolve_place, to_andromeda_polygon,
+            )
+        except ImportError as exc:
+            sys.exit(f"place lookup needs the geospatial extras: {exc}\n"
+                     "  pip install geopandas pandas shapely")
+
+        try:
+            place = resolve_place(
+                args.place, require_status=not args.allow_unverified_scope
+            )
+        except PlaceError as exc:
+            print(f"{type(exc).__name__}: {exc}")
+            return 1
+
+        fields = account_fields(place, use_ecc_name=args.use_ecc_name)
+        if args.account_id:
+            fields["account_id"] = args.account_id
+        polygon = to_andromeda_polygon(place)
+        box = bbox(polygon)
+
+        print(f"query      : {args.place!r}")
+        print(f"resolved   : {place}")
+        print(f"scope      : {place.status} ({len(place.eccs)} ECC(s) registered)")
+        for ecc in place.eccs:
+            print(f"               {ecc.get('name')} (FCC {ecc.get('fcc_psap_id')})")
+        print(f"bbox       : lon {box[0]:.4f}..{box[2]:.4f}  "
+              f"lat {box[1]:.4f}..{box[3]:.4f}")
+        print(f"polygon    : {len(json.dumps(polygon))} bytes")
+        print()
+        print("account fields:")
+        for key in ("authority_name", "account_id", "country", "state"):
+            print(f"  {key:16}: {fields[key]!r}")
+
+        if args.stage == "place":
+            print("\n[place] lookup only. Use --stage sandbox to provision.")
+            return 0
+
+        print()
+        try:
+            account = create_sandbox_account(
+                client, args.place,
+                authority=args.authority_id,
+                account_id=args.account_id,
+                use_ecc_name=args.use_ecc_name,
+                require_status=not args.allow_unverified_scope,
+                standard=load_standard(args.standard),
+                product=args.product,
+                app_name=args.app_name,
+                if_exists=ExistsPolicy(args.if_exists),
+                allow_other_authorities=args.allow_other_authorities,
+                dry_run=not args.apply,
+            )
+        except PartialProvisionError as exc:
+            print(f"STOPPED at {exc.failed_step}")
+            print(f"  cause: {exc.cause}")
+            print(f"  completed: {', '.join(exc.result.steps) or 'nothing'}")
+            return 1
+        except (PlaceError, AccountInfoError) as exc:
+            print(f"{type(exc).__name__}: {exc}")
+            return 1
+        except ApiError as exc:
+            print(f"API ERROR: {exc}")
+            return 1
+
+        if not args.apply:
+            print("[dry-run] nothing sent. Re-run with --apply.")
+            return 0
+
+        for step in account.provision.steps:
+            print(f"  done: {step}")
+        print(f"\n{account.summary()}")
+        return 0
 
     # --------------------------------------------------------- provision
     if args.stage == "provision":

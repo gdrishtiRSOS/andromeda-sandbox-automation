@@ -23,6 +23,10 @@ Design notes
   creating a jurisdiction is safe in isolation and an existing jurisdiction is
   not an obstacle -- Andromeda handles overlap itself.
 
+* `export_boundary` reads an existing authority's boundary back out, so one
+  can be copied between accounts the same way a capability set is captured
+  from a configured integration.
+
 * Boundary files live in `andromeda/data/` alongside the standard capability
   set, so a boundary can be named rather than pathed: "dublin" finds
   data/dublin.geojson. A full path still works.
@@ -56,6 +60,8 @@ __all__ = [
     "available_boundaries",
     "resolve_boundary",
     "create_jurisdiction",
+    "export_boundary",
+    "get_jurisdiction",
     "list_jurisdictions",
     "load_geojson",
     "set_status",
@@ -284,6 +290,77 @@ def _path(authority_id: str, jurisdiction_id: str | None = None) -> str:
 def list_jurisdictions(client: JurisdictionClient, authority_id: str) -> list[Jurisdiction]:
     data = client.get(_path(authority_id))
     return [Jurisdiction.from_api(item) for item in data or []]
+
+
+def get_jurisdiction(
+    client: JurisdictionClient, authority_id: str, jurisdiction_id: str
+) -> Jurisdiction:
+    return Jurisdiction.from_api(client.get(_path(authority_id, jurisdiction_id)))
+
+
+def export_boundary(
+    client: JurisdictionClient,
+    authority_id: str,
+    jurisdiction_id: str | None = None,
+) -> dict[str, Any]:
+    """Read an existing authority's boundary back as a FeatureCollection.
+
+    The same shape `attach_jurisdiction` posts, so a boundary can be copied
+    from one account to another -- the equivalent of capturing a capability
+    set from a configured integration.
+
+    The list endpoint does not always carry the geometry, so the jurisdiction
+    is re-read individually when `exact_polygon` is absent.
+
+    Raises
+    ------
+    JurisdictionError
+        The authority has no jurisdictions, has several and none was named,
+        or the named one does not exist.
+    InvalidGeometryError
+        The stored geometry is unusable.
+    """
+    listed = list_jurisdictions(client, authority_id)
+    if not listed:
+        raise JurisdictionError(f"authority {authority_id} has no jurisdiction")
+
+    if jurisdiction_id is None:
+        if len(listed) > 1:
+            ids = ", ".join(j.id for j in listed)
+            raise JurisdictionError(
+                f"authority {authority_id} has {len(listed)} jurisdictions ({ids}); "
+                "name one explicitly"
+            )
+        chosen = listed[0]
+    else:
+        chosen = next((j for j in listed if j.id == str(jurisdiction_id)), None)
+        if chosen is None:
+            raise JurisdictionError(
+                f"authority {authority_id} has no jurisdiction {jurisdiction_id}; "
+                f"it has {', '.join(j.id for j in listed)}"
+            )
+
+    polygon = chosen.raw.get("exact_polygon")
+    if not polygon:
+        log.debug("the list omitted the geometry; re-reading jurisdiction %s", chosen.id)
+        chosen = get_jurisdiction(client, authority_id, chosen.id)
+        polygon = chosen.raw.get("exact_polygon")
+    if not polygon:
+        raise JurisdictionError(
+            f"jurisdiction {chosen.id} returned no exact_polygon"
+        )
+
+    polygon = normalize_geojson(polygon)
+    validate_geojson(polygon)
+
+    box = bbox(polygon)
+    log.info(
+        "exported jurisdiction %s from authority %s: %d feature(s), "
+        "bbox lon %.4f..%.4f lat %.4f..%.4f",
+        chosen.id, authority_id, len(polygon["features"]),
+        box[0], box[2], box[1], box[3],
+    )
+    return polygon
 
 
 def create_jurisdiction(

@@ -50,6 +50,17 @@ Stages
     --stage roles --apply                           grant all data sources
     --stage roles --restore-roles <file> --apply    undo
 
+  Creating the account (runbook step 1)
+    No token needed -- these calls are unauthenticated.
+
+    --stage signup --email you+lancaster@rapidsos.com --agency-name "Lancaster NE"
+                   --first-name Ada --last-name Lovelace --apply
+    --stage confirm --confirm-token "<link from the email>" --apply
+
+    Every generated account gets the same password, so anyone on the team can
+    log into one. Addresses cannot be reused. The PSAP call answers 500 but the data lands; verify the
+    authority in Andromeda afterwards.
+
   Account Info (runbook step 2)
     --stage catalogs                       list country codes
     --stage catalogs --country IRL         list that country's regions
@@ -71,6 +82,11 @@ Stages
     --stage jurisdiction --geojson dublin                    dry run
     --stage jurisdiction --geojson dublin --apply            create AND publish
     --stage jurisdiction --geojson dublin --apply --no-activate   create only
+
+  Copying a boundary from another account
+    --stage export-boundary                          writes andromeda/data/
+    --stage export-boundary --out my-boundary.geojson
+    --stage export-boundary --jurisdiction-id 3799   when there are several
 
   Jurisdiction activation (runbook step 7)
     --stage pending                inspect the batch, read-only
@@ -131,8 +147,15 @@ from andromeda.jurisdictions import (
     attach_jurisdiction,
     available_boundaries,
     bbox,
+    export_boundary,
     list_jurisdictions,
     load_geojson,
+)
+from andromeda.signup import (
+    SignupError,
+    confirm_email,
+    default_password,
+    sign_up,
 )
 from andromeda.roles import (
     RoleError,
@@ -178,7 +201,9 @@ class SimpleClient:
                  token: str | None = None):
         self.base = base_url.rstrip("/")
         self.s = requests.Session()
-        self.s.headers.update({"x-rapidsos-org": org, "Accept": "application/json"})
+        self.s.headers["Accept"] = "application/json"
+        if org:
+            self.s.headers["x-rapidsos-org"] = org
         if token:
             # tolerate the value being pasted with or without the "Bearer " prefix
             token = token.strip()
@@ -313,7 +338,7 @@ def inspect_token(token: str | None) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--authority-id", required=True,
+    p.add_argument("--authority-id", default=None,
                    help="the numeric id, or the authority's name "
                         "(looked up automatically)")
     p.add_argument("--integration-id", help="omit with --stage scratch to create one")
@@ -322,7 +347,7 @@ def main() -> int:
                    choices=["read", "plan", "apply", "verify", "create", "scratch",
                             "pending", "activate", "jurisdiction", "provision",
                             "account-info", "catalogs", "place", "sandbox",
-                            "roles"],
+                            "roles", "export-boundary", "signup", "confirm"],
                    default="read", help="'scratch' is an alias for 'create'")
     p.add_argument("--revision-number", type=int,
                    help="override the generated revision number (default: day + month)")
@@ -335,6 +360,17 @@ def main() -> int:
                         "authority when omitted")
     p.add_argument("--portal-base-url", default=PORTAL_BASE)
     p.add_argument("--restore-roles", help="a role snapshot JSON file to write back")
+    p.add_argument("--jurisdiction-id",
+                   help="which jurisdiction to export, when an authority has several")
+    p.add_argument("--out", help="where --stage export-boundary writes the file")
+    p.add_argument("--email", help="sign-up address, e.g. you+lancaster@rapidsos.com")
+    p.add_argument("--agency-name", help="becomes the authority name in Andromeda")
+    p.add_argument("--first-name")
+    p.add_argument("--last-name")
+    p.add_argument("--password",
+                   help="defaults to the shared sandbox password")
+    p.add_argument("--confirm-token",
+                   help="the confirmation token, or the whole emailed link")
     p.add_argument("--place", help='what to create, e.g. "Lincoln, Nebraska" or 48477')
     p.add_argument("--use-ecc-name", action="store_true",
                    help="name the authority after the registered ECC")
@@ -364,10 +400,91 @@ def main() -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
+    if args.stage not in ("signup", "confirm") and not args.authority_id:
+        sys.exit("--authority-id is required for this stage")
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)-7s %(message)s",
     )
+
+    # -------------------------------------------------- signup / confirm
+    if args.stage in ("signup", "confirm"):
+        portal = SimpleClient(args.portal_base_url, None, None, [], None)
+        print(f"portal    : {args.portal_base_url}")
+        print("auth      : none (these calls are unauthenticated)\n")
+
+        if args.stage == "confirm":
+            if not args.confirm_token:
+                sys.exit("--stage confirm needs --confirm-token "
+                         "(the token, or the whole link from the email)")
+            try:
+                if not args.apply:
+                    from andromeda.signup import token_from_link
+                    print(f"token     : ...{token_from_link(args.confirm_token)[-12:]}")
+                    print("\n[dry-run] nothing sent. Re-run with --apply.")
+                    return 0
+                confirm_email(portal, args.confirm_token)
+            except SignupError as exc:
+                print(f"SignupError: {exc}")
+                return 1
+            except ApiError as exc:
+                print(f"API ERROR: {exc}")
+                return 1
+            print("email confirmed.")
+            return 0
+
+        missing = [n for n, v in (("--email", args.email),
+                                  ("--agency-name", args.agency_name),
+                                  ("--first-name", args.first_name),
+                                  ("--last-name", args.last_name)) if not v]
+        if missing:
+            sys.exit(f"--stage signup needs {', '.join(missing)}")
+
+        try:
+            password = args.password or default_password(args.email)
+        except SignupError as exc:
+            print(f"SignupError: {exc}")
+            return 1
+
+        print(f"email     : {args.email}")
+        print(f"agency    : {args.agency_name}   (becomes the authority name)")
+        print(f"contact   : {args.first_name} {args.last_name}")
+        print(f"password  : {password}")
+        print()
+
+        try:
+            result = sign_up(
+                portal,
+                email=args.email,
+                agency_name=args.agency_name,
+                first_name=args.first_name,
+                last_name=args.last_name,
+                password=password,
+                dry_run=not args.apply,
+            )
+        except SignupError as exc:
+            print(f"SignupError: {exc}")
+            return 1
+        except ApiError as exc:
+            print(f"API ERROR: {exc}")
+            print("\nAddresses cannot be reused -- try a different +tag.")
+            return 1
+
+        if not args.apply:
+            print("[dry-run] nothing sent. Re-run with --apply.")
+            return 0
+
+        print(result.summary())
+        print()
+        print("Next:")
+        print(f"  1. open the email sent to {args.email} and follow step 1 of its")
+        print("     instructions, or run:")
+        print("       --stage confirm --confirm-token \"<the link>\" --apply")
+        print(f"  2. configure the account:")
+        print(f'       --authority-id "{args.agency_name}" --stage provision '
+              f"--geojson <file> --apply")
+        return 0
 
     token = os.environ.get("ANDROMEDA_TOKEN")
     print(f"base URL  : {args.base_url}")
@@ -383,7 +500,7 @@ def main() -> int:
         os.environ.get("ANDROMEDA_COOKIE"), args.header, token,
     )
 
-    if not str(args.authority_id).strip().isdigit():
+    if args.authority_id and not str(args.authority_id).strip().isdigit():
         wanted = args.authority_id
         try:
             args.authority_id = resolve_authority_id(client, wanted)
@@ -430,7 +547,8 @@ def main() -> int:
 
     if args.stage not in ("pending", "activate", "jurisdiction", "provision",
                           "account-info", "catalogs", "place", "sandbox",
-                          "roles") and not args.integration_id:
+                          "roles", "export-boundary", "signup", "confirm") \
+            and not args.integration_id:
         sys.exit("--integration-id is required for this stage")
 
     # ----------------------------------------------------------- catalogs
@@ -505,6 +623,32 @@ def main() -> int:
             print("\n[dry-run] nothing sent. Re-run with --apply.")
             return 0
         print(f"\n{report.summary()}")
+        return 0
+
+    # --------------------------------------------------- export-boundary
+    if args.stage == "export-boundary":
+        try:
+            polygon = export_boundary(client, args.authority_id, args.jurisdiction_id)
+        except (JurisdictionError, InvalidGeometryError) as exc:
+            print(f"{type(exc).__name__}: {exc}")
+            return 1
+        except ApiError as exc:
+            print(f"API ERROR: {exc}")
+            return 1
+
+        box = bbox(polygon)
+        print(f"features   : {len(polygon['features'])}")
+        print(f"bbox       : lon {box[0]:.4f}..{box[2]:.4f}  "
+              f"lat {box[1]:.4f}..{box[3]:.4f}")
+        print(f"size       : {len(json.dumps(polygon))} bytes")
+
+        out = args.out or str(
+            Path("andromeda/data") / f"authority-{args.authority_id}.geojson"
+        )
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(json.dumps(polygon, indent=2), encoding="utf-8")
+        print(f"\nwritten to : {out}")
+        print(f"use it with: --geojson {Path(out).stem}")
         return 0
 
     # -------------------------------------------------------------- roles

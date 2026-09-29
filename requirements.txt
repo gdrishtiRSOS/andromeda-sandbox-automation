@@ -1,0 +1,26 @@
+# Install once, from the project root:
+#     python -m pip install -r requirements.txt
+#     python -m playwright install chromium      # the browser sign-in drives
+#
+# Tested on Python 3.9.
+
+# API calls -- everything needs this
+requests>=2.31
+
+# the web page (start.bat / start.sh)
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9      # boundary and HAR uploads
+pydantic>=2.0
+
+# signing in to Andromeda through a browser (web page and --stage session --sign-in)
+playwright>=1.40
+
+# US place lookups (--place, and the page's "A US place" boundary option)
+geopandas>=0.14
+pandas>=2.0
+shapely>=2.0
+
+# tests
+pytest>=7.0
+httpx>=0.27                  # FastAPI's TestClient

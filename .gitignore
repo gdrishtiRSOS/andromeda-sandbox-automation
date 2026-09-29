@@ -1,0 +1,14 @@
+# Credentials: one person's, on their own machine. Never commit them.
+.andromeda-session.json
+.andromeda-browser/
+token.txt
+
+# HAR captures hold live tokens and personal data
+har/
+*.har
+
+# account configuration taken before each write
+snapshots/
+
+__pycache__/
+.pytest_cache/

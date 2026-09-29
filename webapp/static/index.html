@@ -1,0 +1,1187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox Account Setup</title>
+<!--
+  One page, no build step. Three regions, top to bottom:
+    1. Sign-in   -- Andromeda, through a browser window the app opens; the server
+                    keeps the session and this page only learns who and for how
+                    long. The portal side logs in as the new account by itself
+    2. Account   -- the form: who, which agency, which boundary; Preview, Create
+    3. Progress  -- steps streamed from the server (Server-Sent Events), the
+                    email gate between the phases, and the outcome
+  All the logic that matters lives in the Python package; this page only asks
+  and shows. Text from the server is always inserted with textContent.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #1c2330; --muted: #5c6675; --line: #dde1e7;
+    --accent: #2458d6; --accent-ink: #ffffff; --ok: #1d7a46; --warn: #9a6200;
+    --bad: #b3261e; --note-bg: #f0f2f5; --warn-bg: #fff6e0; --bad-bg: #fdecea; --ok-bg: #e8f5ee;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --card: #1b2029; --ink: #e6e9ee; --muted: #9aa4b2; --line: #2d3440;
+      --accent: #6f9bff; --accent-ink: #0b1020; --ok: #5ccf8e; --warn: #f0b64a;
+      --bad: #ff8a80; --note-bg: #232a35; --warn-bg: #3a2f14; --bad-bg: #3d1f1d; --ok-bg: #173226;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  h2 { font-size: 1.15rem; margin: 0 0 12px; display: flex; align-items: center; gap: 10px; }
+  h3 { font-size: 1rem; margin: 16px 0 6px; }
+  .num { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 50%;
+         background: var(--accent); color: var(--accent-ink); font-size: .85rem; }
+  .lede { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+          padding: 20px; margin-bottom: 18px; }
+  .callout { background: var(--note-bg); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; }
+  label { display: block; font-weight: 600; margin-bottom: 4px; }
+  .hint { color: var(--muted); font-weight: 400; font-size: .88rem; }
+  input[type=text], input[type=email], input[type=password], input:not([type]) {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--bg); color: var(--ink); font: inherit; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .field { margin-bottom: 14px; }
+  .field-error { color: var(--bad); font-size: .88rem; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row > input { flex: 1; min-width: 180px; }
+  button { font: inherit; padding: 8px 16px; border-radius: 7px; border: 1px solid var(--line);
+           background: var(--card); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.link { border: none; background: none; color: var(--accent); padding: 0; text-decoration: underline; }
+  .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .token-status { font-size: .9rem; margin: 4px 0 14px; min-height: 1.4em; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  .box { border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
+  .box.ok { background: var(--ok-bg); color: var(--ink); }
+  .box.warn { background: var(--warn-bg); color: var(--ink); }
+  .box.bad { background: var(--bad-bg); color: var(--ink); }
+  .box.note { background: var(--note-bg); }
+  .choices label { font-weight: 400; display: flex; gap: 8px; align-items: baseline; margin: 4px 0; }
+  .radio-row { display: flex; gap: 18px; margin-bottom: 10px; flex-wrap: wrap; }
+  .radio-row label { font-weight: 400; display: flex; gap: 6px; }
+  ul.checks, ul.plain { list-style: none; padding: 0; margin: 6px 0; }
+  ul.checks li { padding: 4px 0; }
+  ol.steps { list-style: none; padding: 0; margin: 0; }
+  ol.steps > li { padding: 8px 0; border-bottom: 1px solid var(--line); }
+  ol.steps > li:last-child { border-bottom: none; }
+  .step-head { display: flex; gap: 10px; align-items: baseline; }
+  .icon { width: 1.3em; text-align: center; flex: none; }
+  .step-detail { color: var(--muted); font-size: .9rem; }
+  .step-notes { margin: 4px 0 0 2em; padding: 0; list-style: none; font-size: .9rem; }
+  .step-notes li { background: var(--note-bg); border-radius: 6px; padding: 4px 8px; margin-top: 4px; }
+  li.running .icon { animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .gate { border: 2px solid var(--accent); border-radius: var(--radius); padding: 16px; margin: 14px 0; }
+  .gate .email { font-size: 1.25rem; font-weight: 700; word-break: break-all; }
+  .pre { white-space: pre-wrap; }
+  pre.log { max-height: 260px; overflow: auto; background: var(--note-bg); padding: 10px;
+            border-radius: 8px; font-size: .8rem; white-space: pre-wrap; }
+  code, .mono { font-family: ui-monospace, Consolas, monospace; font-size: .9em; }
+  .secret { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .secret code { background: var(--note-bg); padding: 4px 8px; border-radius: 6px; word-break: break-all; }
+  dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 8px 0; }
+  dl.kv dt { color: var(--muted); } dl.kv dd { margin: 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Create a RapidSOS sandbox account</h1>
+  <p class="lede">Fill in the form, press <b>Preview</b>, then <b>Create</b>. You'll be asked
+    to confirm your email address; after that, press <b>Continue</b> and the rest runs by itself.
+    <button class="link" id="resume-toggle">Resume an existing account instead</button></p>
+
+  <!-- ====================================================== 1. sign-in -->
+  <section class="card" id="signin">
+    <h2><span class="num">1</span> Sign in to your Google RapidSOS Account</h2>
+
+    <div class="token-status" id="signin-state"></div>
+    <div class="actions" style="margin-top:0">
+      <button type="button" class="primary" id="signin-go">Sign in to Andromeda</button>
+      <button type="button" id="signin-forget" hidden>Sign out</button>
+    </div>
+    <ul class="step-notes" id="signin-progress" style="margin-left:0"></ul>
+    <div id="signin-msg"></div>
+
+    <div id="signin-fallback" hidden>
+      <div class="box warn">
+        <b>Signing in needs Playwright, which isn't installed on this computer.</b>
+        Whoever set up the app can install it by running this once, then restarting the app:
+        <pre class="log" id="signin-install"></pre>
+      </div>
+      <h3>Or, without installing it: use a saved sign-in</h3>
+      <ol>
+        <li>Open a new Chrome window, press <b>F12</b>, open the <b>Network</b> tab and tick
+          <b>Preserve log</b>.</li>
+        <li>Go to <code>andromeda.sandbox.rapidsos.com</code> and sign in with Google.</li>
+        <li>Right-click the list of requests and choose <b>Save all as HAR with content</b>.</li>
+        <li>Choose that file here:</li>
+      </ol>
+      <input type="file" id="signin-har" accept=".har,application/json">
+      <div id="signin-har-out"></div>
+      <p class="hint">That file holds your live sign-in. The app reads it once and keeps only the
+        session. Delete the file afterwards.</p>
+    </div>
+
+    <details>
+      <summary>About signing in</summary>
+      <p>The first time, a browser window opens: sign in with Google there, then come back to
+        this tab. After that, signing in finishes on its own in a few seconds. A sign-in lasts
+        about a day.</p>
+      <p class="muted">The sign-in is kept on this computer only, in the app's folder, and is
+        never shown on this page. It is yours: don't copy it to anyone else.</p>
+    </details>
+  </section>
+
+  <!-- ====================================================== resume -->
+  <section class="card" id="resume" hidden>
+    <h2>Resume an existing account</h2>
+    <p class="muted">For an account that already exists, whether it was set up by hand, left
+      unfinished, or created before the app was restarted. Steps that are already done are
+      detected and skipped. Needs the Andromeda sign-in.</p>
+    <div class="field">
+      <label for="resume-authority">Authority name or id</label>
+      <div class="row"><input id="resume-authority">
+        <button type="button" id="resume-find">Find</button></div>
+    </div>
+    <div class="field">
+      <label for="resume-email">Account email <span class="hint">the app logs in to the portal
+        as this account to set its roles; filled in from the authority once found</span></label>
+      <input type="email" id="resume-email" placeholder="you+authority@rapidsos.com">
+    </div>
+    <label class="hint" style="font-weight:400"><input type="checkbox" id="resume-use-boundary">
+      Also attach the boundary chosen in the form below. Only needed if the account has no
+      boundary yet. The account ID, country and state from the form are used too, if filled in.</label>
+    <label class="hint" style="font-weight:400"><input type="checkbox" id="resume-use-capabilities">
+      Also apply the capabilities copied in the form below, instead of the standard set. The
+      copied set is held only while the app is running: if it was restarted, find the source
+      account again first.</label>
+    <div id="resume-out"></div>
+  </section>
+
+  <!-- ====================================================== 2. form -->
+  <section class="card" id="account">
+    <h2><span class="num">2</span> The account</h2>
+    <div class="grid">
+      <div class="field"><label for="f-email">Email </label>
+        <input type="email" id="f-email" placeholder="you+authority@rapidsos.com">
+        <div class="field-error" data-error="email"></div></div>
+      <div class="field"><label for="f-agency_name">Agency/Authority name </label>
+        <input id="f-agency_name" placeholder="Lancaster County NE Sandbox">
+        <div class="field-error" data-error="agency_name"></div></div>
+      <div class="field"><label for="f-first_name">First name</label>
+        <input id="f-first_name"><div class="field-error" data-error="first_name"></div></div>
+      <div class="field"><label for="f-last_name">Last name</label>
+        <input id="f-last_name"><div class="field-error" data-error="last_name"></div></div>
+    </div>
+
+    <h3>Boundary</h3>
+    <div class="radio-row">
+      <label><input type="radio" name="bsource" value="place" checked> A US place</label>
+      <label><input type="radio" name="bsource" value="file"> A .geojson file</label>
+      <label><input type="radio" name="bsource" value="account"> Copy from an existing account</label>
+    </div>
+    <div id="by-place">
+      <div class="row"><input id="f-place" placeholder="Lincoln, NE   or   Lancaster County, NE   or   31109">
+        <button type="button" id="place-lookup">Look up</button></div>
+      <div class="hint" id="place-lookup-state"></div>
+      <div id="place-out"></div>
+    </div>
+    <div id="by-file" hidden>
+      <input type="file" id="f-file" accept=".geojson,.json,application/geo+json,application/json">
+      <div id="file-out"></div>
+    </div>
+    <div id="by-account" hidden>
+      <p class="hint" style="margin-top:0">Copies the boundary of the account's <b>Active</b>
+        jurisdiction. One that is still pending is never copied. The country and state are
+        filled in from that account. Nothing is written to it.</p>
+      <div class="row"><input id="bound-source" placeholder="Authority name or id to copy from">
+        <button type="button" id="bound-find">Find</button></div>
+      <div class="hint" id="bound-find-state"></div>
+      <div id="bound-out"></div>
+    </div>
+    <div class="field-error" data-error="boundary"></div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="field"><label for="f-account_id">Account ID <span class="hint">optional</span></label>
+        <input id="f-account_id" placeholder="SAND_31109"></div>
+      <div class="field"><label for="f-country">Country</label>
+        <input id="f-country" list="countries" placeholder="USA">
+        <datalist id="countries"></datalist>
+        <div class="field-error" data-error="country"></div></div>
+      <div class="field"><label for="f-state">State</label>
+        <input id="f-state" list="states" placeholder="NE">
+        <datalist id="states"></datalist>
+        <div class="field-error" data-error="state"></div></div>
+    </div>
+    <p class="hint" id="fields-hint">Filled in from the place when you look one up. You can
+      edit them.</p>
+
+    <h3>Capabilities</h3>
+    <div class="radio-row">
+      <label><input type="radio" name="csource" value="default" checked> The standard sandbox set (Boiler911)</label>
+      <label><input type="radio" name="csource" value="copy"> Copy from an existing account</label>
+    </div>
+    <div id="caps-copy" hidden>
+      <p class="hint" style="margin-top:0">Only the capabilities are copied, not the boundary or
+        the account details. Nothing is written to the account you copy from.</p>
+      <div class="row"><input id="cap-source" placeholder="Authority name or id to copy from">
+        <button type="button" id="cap-find">Find</button></div>
+      <div class="hint" id="cap-find-state"></div>
+      <div id="cap-out"></div>
+    </div>
+    <div class="field-error" data-error="capabilities"></div>
+
+    <div class="actions">
+      <button type="button" id="preview">Preview</button>
+      <button type="button" class="primary" id="create" disabled>Create</button>
+    </div>
+    <div id="preview-out"></div>
+  </section>
+
+  <!-- ====================================================== 3. progress -->
+  <section class="card" id="progress" hidden>
+    <h2><span class="num">3</span> Progress</h2>
+    <ol class="steps" id="steps"></ol>
+
+    <div class="gate" id="gate" hidden>
+      <div>Check your email:</div>
+      <div class="email" id="gate-email"></div>
+      <p>Open the message from RapidSOS and click its confirmation link. Then press
+        <b>Continue</b>, and the remaining steps run without you.</p>
+      <label style="font-weight:400"><input type="checkbox" id="gate-clicked">
+        I've clicked the link in the email</label>
+      <p class="muted" style="margin:10px 0 4px">Or paste the link here instead of clicking it:</p>
+      <div class="row"><input id="gate-link" placeholder="https://sandbox.rapidsosportal.com/confirmation-email/?token=...">
+        <button type="button" id="gate-confirm">Confirm</button></div>
+      <div id="gate-out"></div>
+    </div>
+
+    <div id="continue-box" hidden>
+      <div class="actions"><button type="button" class="primary" id="continue">Continue</button></div>
+      <div id="continue-out"></div>
+    </div>
+
+    <div id="outcome"></div>
+
+    <details style="margin-top:14px"><summary>Detailed log</summary><pre class="log" id="log"></pre></details>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ------------------------------------------------------------------ state
+// Everything the page knows. No token is ever here: the server holds the
+// Andromeda session, and the page only hears who is signed in and for how long.
+const S = {
+  session: null,               // the last /api/session report
+  signInStream: null,          // a sign-in in progress
+  showFallback: false,         // the saved-sign-in upload, once sign-in cannot open a browser
+  boundaryId: null,
+  captureId: null,             // the copied capability set chosen, if any
+  previewRunId: null,          // the previewed run Create will send
+  runId: null,
+  runKind: null,
+  runStatus: null,
+  lastEventId: -1,
+  stream: null,
+  steps: [],                   // [{key, label}]
+  gateConfirmed: false,
+};
+const QUIET = new Set(["previewed", "signup_failed", "awaiting_email",
+                       "awaiting_continue", "done", "failed"]);
+
+// ---------------------------------------------------------------- helpers
+const $ = (id) => document.getElementById(id);
+
+/** Build an element. Children may be strings (inserted as text) or nodes. */
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v === true ? "" : v);
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+function show(target, ...nodes) { target.replaceChildren(...nodes); }
+
+/** Call the server. The header tells it the request came from this page;
+ *  it refuses writes without it, since it holds the Andromeda session. */
+async function api(path, { method = "GET", body, form } = {}) {
+  const headers = { "X-Sandbox-Page": "1" };
+  let payload;
+  if (form) payload = form;
+  else if (body !== undefined) { headers["Content-Type"] = "application/json"; payload = JSON.stringify(body); }
+  let response;
+  try {
+    response = await fetch(path, { method, headers, body: payload });
+  } catch (err) {
+    return { ok: false, status: 0, data: { error: "The app isn't responding. Is its window still open?" } };
+  }
+  let data = null;
+  try { data = await response.json(); } catch (_) { data = {}; }
+  return { ok: response.ok, status: response.status, data };
+}
+
+function duration(seconds) {
+  const mins = Math.round(seconds / 60);
+  if (mins < 60) return `${mins} min`;
+  return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
+}
+function clock(iso) {
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function bboxText(b) {
+  if (!b) return "";
+  return `lon ${b[0].toFixed(4)} to ${b[2].toFixed(4)}, lat ${b[1].toFixed(4)} to ${b[3].toFixed(4)}`;
+}
+function list(items, cls = "plain") { return el("ul", { class: cls }, items.map((t) => el("li", {}, t))); }
+
+// -------------------------------------------------------------- 1. sign-in
+function signedIn() { return Boolean(S.session && S.session.state === "signed_in"); }
+
+function sessionLeft() {
+  if (!S.session || !S.session.expires_at) return null;
+  return (new Date(S.session.expires_at) - new Date()) / 1000;
+}
+
+async function refreshSession() {
+  const { ok, data } = await api("/api/session");
+  if (ok) setSession(data);
+}
+
+function setSession(report) {
+  const was = signedIn();
+  S.session = report;
+  renderSession();
+  updateCapFind();
+  updateBoundFind();
+  if (signedIn() && !was) loadCountries();
+  // a sign-in started before the page was reloaded: follow it
+  if (report.sign_in && report.sign_in.running && !S.signInStream) watchSignIn(report.sign_in.running);
+}
+
+function renderSession() {
+  const r = S.session;
+  const out = $("signin-state");
+  const env = Boolean(r && r.source === "env");
+  const available = Boolean(r && r.sign_in && r.sign_in.available);
+  $("signin-go").hidden = !r || env;
+  $("signin-go").disabled = Boolean(S.signInStream) || !available;
+  $("signin-go").textContent = r && r.state !== "signed_out" ? "Sign in again" : "Sign in to Andromeda";
+  $("signin-forget").hidden = !r || r.source !== "session" || Boolean(S.signInStream);
+  $("signin-fallback").hidden = !r || env || !(S.showFallback || !available);
+  if (r && r.sign_in) $("signin-install").textContent = r.sign_in.install;
+  if (!r) { show(out, el("span", { class: "muted" }, "Checking…")); return; }
+  if (S.signInStream) { show(out, el("span", { class: "muted" }, "Signing in…")); return; }
+
+  const left = sessionLeft();
+  const until = left !== null && left > 0 ? `${duration(left)} left (until ${clock(r.expires_at)})` : null;
+  if (r.state === "signed_out") {
+    show(out, el("span", { class: "muted" }, "Not signed in. Not needed until Continue."));
+    return;
+  }
+  if (r.state !== "signed_in") {
+    show(out, el("span", { class: "bad" }, `✗ ${r.problem || r.detail || "The sign-in cannot be used."}`));
+    return;
+  }
+  const who = env ? `Using the token from ANDROMEDA_TOKEN (${r.user || "unknown user"})`
+                  : `Signed in as ${r.user || "you"}`;
+  let cls = "ok", mark = "✓", warning = null;
+  if (r.live === "failed") { cls = "bad"; mark = "✗"; }
+  else if (left !== null && left < (env ? 600 : 3600)) {
+    cls = "warn"; mark = "⚠";
+    warning = env ? "Expires soon. Set a fresh ANDROMEDA_TOKEN and restart the app before you press Continue."
+                  : "Runs out soon. Press Sign in again before you start a run.";
+  }
+  show(out, ...[
+    el("span", { class: cls }, `${mark} ${[who, until].filter(Boolean).join(" · ")}`),
+    r.live === "failed" ? el("div", { class: "bad" }, r.detail) : null,
+    warning ? el("div", { class: "warn" }, warning) : null,
+    env ? el("div", { class: "hint" }, "Signing in is off while ANDROMEDA_TOKEN is set. Restart the app without it to sign in instead.") : null,
+  ].filter(Boolean));
+}
+
+async function startSignIn() {
+  show($("signin-progress"));
+  show($("signin-msg"));
+  const { status, data } = await api("/api/session/sign-in", { method: "POST" });
+  if (status === 202 || (status === 409 && data.kind === "busy")) { watchSignIn(data.job_id); return; }
+  if (data.kind === "playwright_missing") S.showFallback = true;
+  show($("signin-msg"), el("div", { class: "box bad pre" }, data.error || `Could not start signing in (${status})`));
+  renderSession();
+}
+
+/** Follow a sign-in: its status messages, then how it ended. */
+function watchSignIn(jobId) {
+  if (S.signInStream) S.signInStream.close();
+  show($("signin-progress"), el("li", {},
+    "If a browser window opens, sign in with Google there, then come back to this tab."));
+  const es = new EventSource(`/api/session/sign-in/${jobId}/events`);
+  S.signInStream = es;
+  renderSession();
+  const finish = () => { es.close(); S.signInStream = null; refreshSession(); };
+  es.addEventListener("note", (e) => $("signin-progress").append(el("li", {}, JSON.parse(e.data).message)));
+  es.addEventListener("failed", (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.kind === "playwright_missing" || ev.kind === "stopped") S.showFallback = true;
+    show($("signin-msg"), el("div", { class: "box bad pre" }, ev.message));
+  });
+  es.addEventListener("done", () => show($("signin-msg"), el("div", { class: "box ok" }, "✓ Signed in.")));
+  es.addEventListener("status", (e) => {
+    const status = JSON.parse(e.data).status;
+    if (status === "signed_in" || status === "sign_in_failed") finish();
+  });
+  // a sign-in the server no longer knows (it was restarted): stop following it
+  es.onerror = () => { if (es.readyState === EventSource.CLOSED) finish(); };
+}
+
+async function uploadSavedSignIn(file) {
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  const out = $("signin-har-out");
+  show(out, el("p", { class: "muted" }, "Reading the sign-in…"));
+  const { ok, data } = await api("/api/session/har", { method: "POST", form });
+  $("signin-har").value = "";
+  if (!ok) { show(out, el("div", { class: "box bad" }, data.error || "That file could not be used.")); return; }
+  show(out, el("div", { class: "box ok" }, "✓ Signed in from the saved file. Delete the .har file now: it holds your live sign-in."));
+  setSession(data);
+}
+
+async function signOut() {
+  const { ok, data } = await api("/api/session/sign-out", { method: "POST" });
+  show($("signin-progress"));
+  show($("signin-msg"));
+  if (ok) setSession(data);
+}
+
+/** Continue and the other Andromeda reads were refused: say why, show sign-in. */
+function needSignIn(out, message) {
+  show(out, el("div", { class: "box bad" }, message));
+  refreshSession();
+  $("signin").scrollIntoView({ behavior: "smooth" });
+}
+
+// ---------------------------------------------------------------- 2. form
+const FIELDS = ["email", "first_name", "last_name", "agency_name", "account_id", "country", "state"];
+function formValues() {
+  const values = {};
+  for (const f of FIELDS) values[f] = $(`f-${f}`).value.trim();
+  values.boundary_id = S.boundaryId;
+  values.capabilities_source = capabilityMode();
+  values.capabilities_capture_id = capabilityMode() === "copy" ? S.captureId : null;
+  return values;
+}
+
+/** Any change to what would be created invalidates the last preview. */
+function invalidatePreview() {
+  if (!S.previewRunId) return;
+  S.previewRunId = null;
+  $("create").disabled = true;
+  show($("preview-out"), el("p", { class: "muted" }, "The form changed. Press Preview again."));
+}
+
+function setBoundary(id) { S.boundaryId = id; invalidatePreview(); }
+
+/** Which of the three sources of geometry is chosen. Only ever one. */
+function boundaryMode() {
+  return document.querySelector("input[name=bsource]:checked").value;
+}
+
+/** The same lines for a place, a file or a copied boundary. */
+function boundaryFacts(b) {
+  return `${b.features} feature(s) · ${bboxText(b.bbox)} · ${Math.max(1, Math.round(b.bytes / 1024))} KB to post`;
+}
+
+function fillFields(fields) {
+  for (const k of ["account_id", "country", "state"]) {
+    if (fields[k]) $(`f-${k}`).value = fields[k];
+  }
+  if (fields.country) loadStates(fields.country);
+}
+
+// --- boundary copied from another account: its Active jurisdiction only
+function updateBoundFind() {
+  const ready = signedIn();
+  $("bound-find").disabled = !ready;
+  $("bound-find-state").textContent = ready ? "" :
+    "Sign in to Andromeda at the top of the page to read another account's boundary.";
+}
+
+function useCopiedBoundary(b) {
+  if (boundaryMode() !== "account") return;
+  setBoundary(b.boundary_id);
+  fillFields(b.fields || {});
+  show($("bound-out"), el("div", { class: "box ok" },
+    el("b", {}, `✓ ${b.label}`), el("div", { class: "mono" }, boundaryFacts(b)),
+    el("div", { class: "hint" }, "Country and state are filled in from that account below; you can edit them.")));
+}
+
+async function findBoundarySource(name) {
+  const query = (name || $("bound-source").value).trim();
+  const out = $("bound-out");
+  if (!query) return;
+  if (!signedIn()) { updateBoundFind(); return; }
+  setBoundary(null);
+  show(out, el("p", { class: "muted" }, "Reading its jurisdictions…"));
+  const { status, data } = await api(`/api/boundary-sources?authority=${encodeURIComponent(query)}`);
+  if (boundaryMode() !== "account") return;
+  if (status === 409 && data.kind === "ambiguous") {
+    show(out, el("div", { class: "box warn" }, el("div", {}, data.message, " Choose one:"),
+      data.candidates.map((c) => el("div", {}, el("button", { type: "button",
+        onclick: () => { $("bound-source").value = String(c.id); findBoundarySource(String(c.id)); } },
+        `Use id ${c.id}`), ` ${c.name} · account ID ${c.account_id || "none"} · organization ${c.organization_id}`))));
+    return;
+  }
+  if (status !== 200) {
+    const near = data.near && data.near.length ? ` Did you mean: ${data.near.join(", ")}?` : "";
+    const cls = data.kind === "no_jurisdiction" || data.kind === "not_active" ? "warn" : "bad";
+    show(out, el("div", { class: `box ${cls}` }, (data.message || data.error || `Failed (${status})`) + near));
+    return;
+  }
+  if (data.boundary) { useCopiedBoundary(data.boundary); return; }
+
+  // several Active jurisdictions: the user chooses, nothing is pre-selected
+  const a = data.authority;
+  show(out,
+    el("p", { style: "margin:8px 0 4px" }, `${a.name} (id ${a.id}) has ${data.jurisdictions.length} Active jurisdictions. Choose one:`),
+    el("div", { class: "choices" }, data.jurisdictions.map((j) => el("label", {},
+      el("input", { type: "radio", name: "bound-pick", value: j.id,
+                    onchange: () => pickBoundary(a.id, j.id) }),
+      el("span", {}, el("b", {}, `jurisdiction ${j.id}`),
+        el("span", { class: "hint" }, `  ${j.status} · ${j.shapes} shape(s)`))))),
+    data.not_offered && data.not_offered.length
+      ? el("p", { class: "hint" }, "Not offered, because they are not Active: " +
+          data.not_offered.map((j) => `${j.id} (${j.status})`).join(", "))
+      : null,
+    el("div", { id: "bound-picked" }));
+}
+
+async function pickBoundary(authorityId, jurisdictionId) {
+  setBoundary(null);
+  const holder = $("bound-picked");
+  show(holder, el("p", { class: "muted" }, "Reading the boundary…"));
+  const { ok, data } = await api("/api/boundary/from-authority",
+    { method: "POST", body: { authority_id: authorityId, jurisdiction_id: jurisdictionId } });
+  if (boundaryMode() !== "account") return;
+  if (!ok) { show(holder, el("div", { class: "box bad" }, data.message || data.error || "Could not copy it")); return; }
+  // keep the choice visible; show the result under it
+  setBoundary(data.boundary.boundary_id);
+  fillFields(data.boundary.fields || {});
+  show(holder, el("div", { class: "box ok" }, el("b", {}, `✓ ${data.boundary.label}`),
+    el("div", { class: "mono" }, boundaryFacts(data.boundary))));
+}
+
+// --- capabilities: the standard set, or one copied from another account
+function capabilityMode() {
+  return document.querySelector("input[name=csource]:checked").value;
+}
+
+function setCapture(id) { S.captureId = id; invalidatePreview(); }
+
+/** Find needs the Andromeda sign-in; say so rather than letting it fail. */
+function updateCapFind() {
+  const ready = signedIn();
+  $("cap-find").disabled = !ready;
+  $("cap-find-state").textContent = ready ? "" :
+    "Sign in to Andromeda at the top of the page to read another account's capabilities.";
+}
+
+async function findCapabilitySource(name) {
+  const query = (name || $("cap-source").value).trim();
+  const out = $("cap-out");
+  if (!query) return;
+  if (!signedIn()) { updateCapFind(); return; }
+  setCapture(null);
+  show(out, el("p", { class: "muted" }, "Reading its integrations…"));
+  const { status, data } = await api(`/api/capability-sources?authority=${encodeURIComponent(query)}`);
+  if (status === 409) {
+    show(out, el("div", { class: "box warn" }, el("div", {}, data.message, " Choose one:"),
+      data.candidates.map((c) => el("div", {}, el("button", { type: "button",
+        onclick: () => { $("cap-source").value = String(c.id); findCapabilitySource(String(c.id)); } },
+        `Use id ${c.id}`), ` ${c.name} · account ID ${c.account_id || "none"} · organization ${c.organization_id}`))));
+    return;
+  }
+  if (status !== 200) {
+    const near = data.near && data.near.length ? ` Did you mean: ${data.near.join(", ")}?` : "";
+    show(out, el("div", { class: "box bad" }, (data.message || data.error || `Failed (${status})`) + near));
+    return;
+  }
+  const a = data.authority;
+  if (!data.integrations.length) {
+    show(out, el("div", { class: "box warn" }, `${a.name} (id ${a.id}) has no integrations, so there is nothing to copy.`));
+    return;
+  }
+  // never pre-selected, even when there is only one
+  show(out,
+    el("p", { style: "margin:8px 0 4px" }, `${a.name} (id ${a.id}) has ${data.integrations.length} ` +
+      `integration${data.integrations.length === 1 ? "" : "s"}. Choose the one to copy:`),
+    el("div", { class: "choices" }, data.integrations.map((i) => el("label", {},
+      el("input", { type: "radio", name: "cap-pick", value: i.capture_id, disabled: i.total === 0,
+                    onchange: () => setCapture(i.capture_id) }),
+      el("span", {}, el("b", {}, i.app_name || `integration ${i.id}`),
+        el("span", { class: "hint" }, `  ${i.product || "unknown product"} · ${i.enabled} of ${i.total} ` +
+          `enabled for the authority, ${i.rsos_enabled} by RapidSOS` +
+          (i.total === 0 ? " · no capabilities, nothing to copy" : "")))))),
+    el("p", { class: "hint" }, `Read at ${clock(data.read_at)}. Nothing is written to ${a.name}.`));
+}
+
+/** The capabilities part of a plan: what is used, how it differs, and any warning. */
+function capabilityPlanNodes(caps, ackId) {
+  if (!caps || caps.source === "default") {
+    return [el("dt", {}, "Capabilities"), el("dd", {}, `the standard sandbox set (${caps ? caps.total : "?"} capabilities)`)];
+  }
+  const from = caps.from;
+  const nodes = [
+    el("dt", {}, "Capabilities"),
+    el("dd", {}, `copied from ${from.authority.name} (id ${from.authority.id}), integration `,
+      el("b", {}, from.integration.app_name), ` · ${caps.total} capabilities`,
+      el("div", { class: "hint" }, `${caps.changed.length} ${caps.changed.length === 1 ? "differs" : "differ"} from the standard set; ` +
+        `${caps.unknown.length} not in the sandbox catalog; ${caps.left_alone} sandbox capabilities ` +
+        "the source does not mention are left as they are. Compared with the sandbox catalog as last " +
+        "captured, since the new integration does not exist yet."),
+      caps.changed.length ? el("details", {}, el("summary", {}, "How it differs from the standard set"),
+        list(caps.changed, "plain mono")) : null),
+  ];
+  if (caps.warning) {
+    nodes.push(el("dt", {}, ""), el("dd", {}, el("div", { class: `box ${caps.needs_ack ? "warn" : "note"}` },
+      el("b", {}, caps.needs_ack ? "⚠ Most of this copy may not apply. " : ""), caps.warning,
+      caps.unknown.length ? el("details", {}, el("summary", {}, `The ${caps.unknown.length} that will be skipped`),
+        list(caps.unknown, "plain mono")) : null,
+      caps.needs_ack ? el("label", { style: "font-weight:400;margin-top:8px" },
+        el("input", { type: "checkbox", id: ackId }),
+        " I understand these capabilities will be skipped. Continue with a partial copy.") : null)));
+  }
+  return nodes;
+}
+
+// place lookup: on the button, or when the field loses focus with a new value
+let lastQuery = null;
+async function lookupPlace(query, { allowUnverified = false } = {}) {
+  query = (query || "").trim();
+  if (!query) return;
+  lastQuery = query;
+  setBoundary(null);
+  show($("place-out"), el("p", { class: "muted" }, "Looking up…"));
+  const params = new URLSearchParams({ q: query, allow_unverified: allowUnverified });
+  const { status, data } = await api(`/api/place?${params}`);
+  if (boundaryMode() !== "place") return;
+  const out = $("place-out");
+
+  if (status === 200) {
+    setBoundary(data.boundary_id);
+    fillFields(data.fields);
+    const eccs = data.eccs.length
+      ? data.eccs.map((e) => `${e.name} (FCC ${e.fcc_psap_id})`)
+      : ["none registered"];
+    show(out, el("div", { class: "box ok" },
+      el("div", {}, el("b", {}, data.label)),
+      el("dl", { class: "kv" },
+        el("dt", {}, "ECCs"), el("dd", {}, eccs.join("; ")),
+        el("dt", {}, "Bounding box"), el("dd", { class: "mono" }, bboxText(data.bbox))),
+      el("div", { class: "hint" }, "Check the bounding box is the right part of the world.")));
+    return;
+  }
+  if (status === 409) {           // ambiguous: offer the candidates, choose nothing
+    const name = "place-choice";
+    const use = el("button", { type: "button", disabled: true }, "Use this one");
+    const radios = data.candidates.map((c) => el("label", {},
+      el("input", { type: "radio", name, value: c.geoid || "", disabled: !c.geoid,
+                    onchange: () => { use.disabled = false; } }), c.label));
+    use.addEventListener("click", () => {
+      const picked = document.querySelector(`input[name=${name}]:checked`);
+      if (picked) { $("f-place").value = picked.value; lookupPlace(picked.value); }
+    });
+    show(out, el("div", { class: "box warn" },
+      el("div", {}, "More than one place matches. Which one do you mean?"),
+      el("div", { class: "choices" }, radios), use));
+    return;
+  }
+  if (status === 404) {
+    const near = (data.near || []).map((n) => el("button", { type: "button", class: "link",
+      onclick: () => { $("f-place").value = `${n}, ${query.split(",").pop().trim()}`; lookupPlace($("f-place").value); } }, n));
+    show(out, el("div", { class: "box bad" }, data.message,
+      near.length ? el("div", {}, "Did you mean: ", near.flatMap((n, i) => i ? [", ", n] : [n])) : null));
+    return;
+  }
+  if (status === 422) {           // no ECCs registered: refuse, offer an explicit opt-in
+    const box = el("input", { type: "checkbox",
+      onchange: (e) => e.target.checked && lookupPlace(query, { allowUnverified: true }) });
+    show(out, el("div", { class: "box warn" },
+      el("div", {}, "The FCC registry lists no emergency communications centres for this " +
+                    "county, so the boundary can't be verified."),
+      el("label", { style: "font-weight:400;margin-top:8px" }, box,
+         " Use this unverified boundary anyway")));
+    return;
+  }
+  show(out, el("div", { class: "box bad" }, data.message || data.error || `Lookup failed (${status})`));
+}
+
+async function uploadBoundary(file) {
+  setBoundary(null);
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  show($("file-out"), el("p", { class: "muted" }, "Checking the file…"));
+  const { ok, data } = await api("/api/boundary", { method: "POST", form });
+  if (boundaryMode() !== "file") return;
+  if (!ok) { show($("file-out"), el("div", { class: "box bad" }, data.error)); return; }
+  setBoundary(data.boundary_id);
+  show($("file-out"), el("div", { class: "box ok" },
+    el("b", {}, data.label), el("div", { class: "mono" }, boundaryFacts(data)),
+    el("div", { class: "hint" }, "Check the bounding box is the right part of the world. " +
+      "Enter the country and state below.")));
+  if (!signedIn()) {
+    $("fields-hint").textContent = "Sign in to Andromeda to get a list of country and state codes.";
+  }
+}
+
+async function loadCountries() {
+  const { ok, data } = await api("/api/catalogs/countries");
+  if (!ok) return;
+  show($("countries"), ...Object.entries(data).map(([code, name]) => el("option", { value: code }, name)));
+  if ($("f-country").value) loadStates($("f-country").value);
+}
+async function loadStates(country) {
+  if (!signedIn() || !country) return;
+  const { ok, data } = await api(`/api/catalogs/countries/${encodeURIComponent(country)}/states`);
+  if (!ok) return;
+  show($("states"), ...Object.entries(data).map(([code, name]) => el("option", { value: code }, name)));
+}
+
+function showFieldErrors(errors) {
+  document.querySelectorAll("[data-error]").forEach((n) => { n.textContent = (errors || {})[n.dataset.error] || ""; });
+}
+
+// Preview: server checks, no writes. Create sends exactly what was previewed.
+async function doPreview() {
+  showFieldErrors({});
+  $("create").disabled = true;
+  show($("preview-out"), el("p", { class: "muted" }, "Checking…"));
+  const { status, data } = await api("/api/runs", { method: "POST", body: formValues() });
+  if (status === 422) {
+    showFieldErrors(data.errors);
+    show($("preview-out"), el("div", { class: "box bad" }, "Some fields need attention (marked above)."));
+    return;
+  }
+  if (status !== 200) { show($("preview-out"), el("div", { class: "box bad" }, data.error || "Preview failed")); return; }
+
+  S.previewRunId = data.run_id;
+  const p = data.plan;
+  const icon = { ok: "✓", warn: "⚠", blocked: "✗", skipped: "–" };
+  const cls = { ok: "ok", warn: "warn", blocked: "bad", skipped: "muted" };
+  show($("preview-out"),
+    el("h3", {}, "What will happen"),
+    el("dl", { class: "kv" },
+      el("dt", {}, "Sign up"), el("dd", {}, `${p.signup.email}, contact ${p.signup.contact}`),
+      el("dt", {}, "Authority name"), el("dd", {}, p.signup.agency_name),
+      el("dt", {}, "Password"), el("dd", {}, el("span", { class: "mono" }, p.signup.password),
+        el("span", { class: "hint" }, "  the shared sandbox password, so anyone on the team can sign in")),
+      el("dt", {}, "Boundary"), el("dd", {}, p.boundary.label, el("div", { class: "mono hint" }, boundaryFacts(p.boundary))),
+      el("dt", {}, "Account info"), el("dd", {},
+        `account ID ${p.account.account_id || "(not set)"}, ${p.account.country} / ${p.account.state}, dispatch type Primary`),
+      capabilityPlanNodes(p.capabilities, "cap-ack")),
+    el("p", {}, "Create signs up now. After you confirm the email, Continue runs: ",
+      p.steps.slice(1).map((s) => s.label).join(" → "), "."),
+    el("h3", {}, "Checks"),
+    el("ul", { class: "checks" }, data.checks.map((c) =>
+      el("li", { class: cls[c.status] }, `${icon[c.status]} ${c.message}`))),
+    data.can_create ? null : el("div", { class: "box bad" }, "Fix the problem marked ✗, then Preview again."));
+  // a copy that mostly will not apply needs the tick before Create
+  const needsAck = Boolean(p.capabilities && p.capabilities.needs_ack);
+  const syncCreate = () => { $("create").disabled = !data.can_create || (needsAck && !$("cap-ack").checked); };
+  if (needsAck) $("cap-ack").addEventListener("change", syncCreate);
+  syncCreate();
+}
+
+async function doCreate() {
+  const runId = S.previewRunId;
+  if (!runId) return;
+  $("create").disabled = true;
+  $("preview").disabled = true;
+  const ack = $("cap-ack");
+  const { status, data } = await api(`/api/runs/${runId}/signup`,
+    { method: "POST", body: { acknowledge_capabilities: Boolean(ack && ack.checked) } });
+  if (status !== 202) {
+    $("preview").disabled = false;
+    show($("preview-out"), el("div", { class: "box bad" }, data.error || "Could not start"));
+    return;
+  }
+  startRun(runId, "new", [{ key: "signup", label: "Sign up" }, ...STEPS], data.status);
+  $("gate-email").textContent = $("f-email").value.trim();
+  openStream();
+}
+
+// ----------------------------------------------------------- 3. progress
+let STEPS = [];      // filled from /api/status
+
+function startRun(runId, kind, steps, status) {
+  S.runId = runId; S.runKind = kind; S.runStatus = status; S.lastEventId = -1;
+  S.steps = steps; S.gateConfirmed = false;
+  history.replaceState(null, "", `#run=${runId}`);
+  $("progress").hidden = false;
+  $("log").textContent = "";
+  show($("outcome"));
+  show($("steps"), ...steps.map((s) => el("li", { id: `step-${s.key}`, class: "pending" },
+    el("div", { class: "step-head" }, el("span", { class: "icon" }, "○"),
+       el("span", {}, el("b", {}, s.label), " ", el("span", { class: "step-detail" }))),
+    el("ul", { class: "step-notes" }))));
+  $("gate").hidden = true;
+  $("continue-box").hidden = true;
+  $("progress").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+const ICONS = { pending: "○", running: "●", done: "✓", skipped: "–", failed: "✗" };
+
+function applyEvent(ev) {
+  if (ev.id <= S.lastEventId) return;
+  S.lastEventId = ev.id;
+  if (ev.type === "step") {
+    const row = $(`step-${ev.step}`);
+    if (!row) return;
+    row.className = ev.status;
+    row.querySelector(".icon").textContent = ICONS[ev.status] || "•";
+    row.querySelector(".icon").className = "icon " + ({ done: "ok", failed: "bad", skipped: "muted" }[ev.status] || "");
+    row.querySelector(".step-detail").textContent = ev.detail || "";
+  } else if (ev.type === "note") {
+    const row = $(`step-${ev.step}`);
+    const target = row ? row.querySelector(".step-notes") : null;
+    if (target) target.append(el("li", {}, ev.message));
+  } else if (ev.type === "log") {
+    $("log").append(`${ev.level.padEnd(7)} ${ev.message}\n`);
+  } else if (ev.type === "status") {
+    onStatus(ev.status);
+  } else if (ev.type === "failed") {
+    renderFailure(ev);
+  } else if (ev.type === "done") {
+    renderSuccess(ev);
+  }
+}
+
+function onStatus(status) {
+  S.runStatus = status;
+  $("gate").hidden = !(status === "awaiting_email");
+  $("continue-box").hidden = !["awaiting_email", "awaiting_continue"].includes(status);
+  if (status === "configuring") { show($("outcome")); show($("continue-out")); }
+  updateContinue();
+  if (QUIET.has(status) && S.stream) { S.stream.close(); S.stream = null; }
+}
+
+function openStream() {
+  if (S.stream) S.stream.close();
+  const es = new EventSource(`/api/runs/${S.runId}/events?after=${S.lastEventId}`);
+  for (const type of ["step", "note", "log", "status", "failed", "done"]) {
+    es.addEventListener(type, (e) => applyEvent(JSON.parse(e.data)));
+  }
+  // The server closes the stream when nothing is running; don't reconnect then.
+  es.onerror = () => { if (QUIET.has(S.runStatus)) { es.close(); S.stream = null; } };
+  S.stream = es;
+}
+
+// --- the gate
+function updateContinue() {
+  const needsGate = S.runKind === "new" && S.runStatus === "awaiting_email";
+  $("continue").disabled = needsGate && !(S.gateConfirmed || $("gate-clicked").checked);
+}
+
+async function confirmLink() {
+  const link = $("gate-link").value.trim();
+  if (!link) return;
+  const { ok, data } = await api(`/api/runs/${S.runId}/confirm`, { method: "POST", body: { link } });
+  if (ok) {
+    S.gateConfirmed = true;
+    show($("gate-out"), el("div", { class: "box ok" }, "✓ Email confirmed. Press Continue."));
+  } else {
+    show($("gate-out"), el("div", { class: "box bad" }, data.error));
+  }
+  updateContinue();
+}
+
+// --- phase 2 (also used by Resume after a failure)
+async function doContinue(acknowledgeExpiry = false) {
+  const out = S.runStatus === "failed" ? $("outcome") : $("continue-out");
+  if (!signedIn()) {
+    needSignIn(out, "Sign in to Andromeda at the top of the page first. It is the only sign-in Continue needs.");
+    return;
+  }
+  $("continue").disabled = true;
+  const email = S.runKind === "resume" ? $("resume-email").value.trim() || null : null;
+  const ack = $("resume-cap-ack");
+  const { status, data } = await api(`/api/runs/${S.runId}/continue`, { method: "POST",
+    body: { clicked_link: $("gate-clicked").checked, acknowledge_expiry: acknowledgeExpiry, email,
+            acknowledge_capabilities: Boolean(ack && ack.checked) } });
+
+  if (status === 202) { S.runStatus = data.status; openStream(); return; }
+  updateContinue();
+  if (status === 409 && data.kind === "expiring") {
+    const which = Object.entries(data.seconds_left)
+      .map(([, s]) => `The Andromeda token expires in ${duration(s)}.`);
+    if (confirm(`${which.join(" ")} A run takes about a minute. Continue anyway?`)) doContinue(true);
+    return;
+  }
+  if (status === 400 && data.kind === "session") {
+    needSignIn(out, data.error);
+    return;
+  }
+  if (status === 409 && data.kind === "capabilities") {
+    show(out, el("div", { class: "box warn" }, data.error,
+      el("p", {}, "Tick the box under the account you found above to continue with a partial copy.")));
+    $("resume").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
+  if (status === 400 && data.kind === "login") {
+    show(out, el("div", { class: "box bad" }, data.error));
+    if (S.runKind === "resume") $("resume").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
+  show(out, el("div", { class: "box bad" }, data.error || `Could not continue (${status})`));
+}
+
+// --- outcomes
+function renderFailure(ev) {
+  const title = ev.refused
+    ? "Refused. Nothing unsafe was done"
+    : `Stopped${ev.step ? ` at: ${labelFor(ev.step)}` : ""}`;
+  const parts = [
+    el("h3", {}, title),
+    el("p", {}, ev.message),
+    ev.exists && ev.exists.length ? [el("b", {}, "Already exists"), list(ev.exists)] : null,
+    ev.not_done && ev.not_done.length ? [el("b", {}, "Not done yet"), list(ev.not_done)] : null,
+    el("p", {}, el("b", {}, "What to do: "), ev.advice),
+  ];
+  const secret = ev.partial && ev.partial.integration;
+  if (secret && secret.consumer_secret) parts.push(secretBlock(secret));
+  if (ev.candidates) {
+    parts.push(el("p", {}, "Choose the right authority:"),
+      el("div", {}, ev.candidates.map((c) => el("div", {}, el("button", { type: "button",
+        onclick: () => { $("resume-authority").value = String(c.id); $("resume").hidden = false; findAuthority(); } },
+        `id ${c.id}`), ` ${c.name} · account ID ${c.account_id || "none"} · organization ${c.organization_id}`))));
+  }
+  if (S.runKind === "new" && ev.step === "signup") {
+    parts.push(el("p", { class: "muted" }, "Change the form and press Preview to try again."));
+    $("preview").disabled = false;
+  } else {
+    parts.push(el("div", { class: "actions" },
+      el("button", { type: "button", class: "primary", onclick: () => doContinue() }, "Resume"),
+      el("span", { class: "hint" }, "Runs the same steps again. Anything already done is detected and skipped.")));
+  }
+  parts.push(undoButtons());
+  show($("outcome"), el("div", { class: `box ${ev.refused ? "warn" : "bad"}` }, parts));
+}
+
+function renderSuccess(ev) {
+  const skipped = (ev.notes || []);
+  const integ = ev.integration;
+  show($("outcome"), el("div", { class: "box ok" },
+    el("h3", {}, "✓ The sandbox account is ready"),
+    el("dl", { class: "kv" },
+      el("dt", {}, "Authority"), el("dd", {}, `${ev.authority.name} (id ${ev.authority.id})`),
+      el("dt", {}, "Organization"), el("dd", {}, ev.authority.organization_id),
+      ev.jurisdiction ? [el("dt", {}, "Jurisdiction"), el("dd", {}, `${ev.jurisdiction.id}, ${ev.jurisdiction.status}`)] : null,
+      integ ? [el("dt", {}, "Integration"), el("dd", {}, `${integ.app_name} (id ${integ.id})${integ.created ? "" : ", reused"}`)] : null,
+      ev.capabilities ? [el("dt", {}, "Capabilities"), el("dd", {}, `${ev.capabilities.changed} change(s)`)] : null,
+      ev.roles ? [el("dt", {}, "Roles"), el("dd", {}, ev.roles)] : null),
+    integ && integ.consumer_secret ? secretBlock(integ) : null,
+    skipped.length ? [el("b", {}, "Skipped, and why (expected, not problems)"), list(skipped)] : null,
+    el("p", {}, "Check in the browser that the jurisdiction reads ", el("b", {}, "Active"),
+      ", that the capabilities are set on the integration, and that the ", el("b", {}, "Alerts tab"),
+      " appears. The tool confirms the API accepted everything, but only the UI confirms the account works."),
+    undoButtons()));
+}
+
+function secretBlock(integ) {
+  const code = el("code", {}, integ.consumer_secret);
+  const copy = el("button", { type: "button", onclick: async () => {
+    try { await navigator.clipboard.writeText(integ.consumer_secret); copy.textContent = "Copied"; }
+    catch (_) { copy.textContent = "Select and copy it"; }
+  } }, "Copy");
+  return el("div", { style: "margin:10px 0" },
+    el("div", {}, el("b", {}, "Consumer secret"), el("span", { class: "hint" },
+      "  shown once, at creation. Store it now if anything needs it.")),
+    el("div", { class: "secret" }, code, copy),
+    integ.consumer_key ? el("div", { class: "hint" }, `consumer key: ${integ.consumer_key}`) : null);
+}
+
+// --- undo: always a preview of the undo first, then an explicit confirm
+function undoButtons() {
+  const holder = el("div", { id: "undo" });
+  const buttons = [["capabilities", "Undo capabilities"], ["roles", "Undo roles"]].map(([kind, label]) =>
+    el("button", { type: "button", onclick: () => previewUndo(kind, holder) }, label));
+  holder.append(el("div", { class: "actions" }, buttons,
+    el("span", { class: "hint" }, "Puts back the snapshot taken just before each was written.")));
+  return holder;
+}
+
+async function previewUndo(kind, holder) {
+  const out = holder.querySelector(".undo-out") || holder.appendChild(el("div", { class: "undo-out" }));
+  const { ok, data } = await api(`/api/runs/${S.runId}/restore`, { method: "POST", body: { kind } });
+  if (!ok) { show(out, el("div", { class: "box bad" }, data.error || "Could not read the snapshot")); return; }
+  if (!data.changes.length) { show(out, el("div", { class: "box note" }, `${kind}: already match the snapshot. Nothing to undo.`)); return; }
+  show(out, el("div", { class: "box warn" },
+    el("div", {}, `Undoing ${kind} from ${data.snapshot} would change:`),
+    list(data.changes.slice(0, 40).concat(data.changes.length > 40 ? [`… and ${data.changes.length - 40} more`] : [])),
+    el("div", { class: "actions" },
+      el("button", { type: "button", class: "primary", onclick: () => applyUndo(kind, out) }, `Yes, undo ${kind}`),
+      el("button", { type: "button", onclick: () => show(out) }, "Cancel"))));
+}
+
+async function applyUndo(kind, out) {
+  const { ok, data } = await api(`/api/runs/${S.runId}/restore`, { method: "POST", body: { kind, apply: true } });
+  show(out, ok
+    ? el("div", { class: "box ok" }, `✓ ${kind} restored from ${data.snapshot} (${data.changes.length} change(s)).`)
+    : el("div", { class: "box bad" }, data.error || "Undo failed"));
+}
+
+function labelFor(key) {
+  const s = S.steps.find((x) => x.key === key);
+  return s ? s.label : key;
+}
+
+// ----------------------------------------------------------------- resume
+async function findAuthority() {
+  const authority = $("resume-authority").value.trim();
+  const out = $("resume-out");
+  if (!authority) return;
+  if (!signedIn()) { needSignIn(out, "Sign in to Andromeda at the top of the page first."); return; }
+  const f = formValues();
+  const body = { authority, email: $("resume-email").value.trim() || null,
+                 account_id: f.account_id, country: f.country, state: f.state,
+                 capabilities_capture_id: $("resume-use-capabilities").checked ? f.capabilities_capture_id : null,
+                 boundary_id: $("resume-use-boundary").checked ? S.boundaryId : null };
+  if ($("resume-use-capabilities").checked && !f.capabilities_capture_id) {
+    show(out, el("div", { class: "box bad" }, "Choose Copy from an existing account in the form below, " +
+      "find the account and pick an integration first, or untick the capabilities box."));
+    return;
+  }
+  const { status, data } = await api("/api/resume", { method: "POST", body });
+  if (status === 409) {
+    show(out, el("div", { class: "box warn" }, el("div", {}, data.message),
+      data.candidates.map((c) => el("div", {}, el("button", { type: "button",
+        onclick: () => { $("resume-authority").value = String(c.id); findAuthority(); } }, `Use id ${c.id}`),
+        ` ${c.name} · account ID ${c.account_id || "none"} · organization ${c.organization_id}`))));
+    return;
+  }
+  if (status === 400 && data.kind === "session") { needSignIn(out, data.error); return; }
+  if (status !== 200) {
+    show(out, el("div", { class: "box bad" }, data.message || data.error || `Failed (${status})`));
+    return;
+  }
+  const a = data.authority;
+  if (data.email && !$("resume-email").value.trim()) $("resume-email").value = data.email;
+  show(out, el("div", { class: "box ok" }, el("p", { style: "margin:0" }, `Found ${a.name} (id ${a.id}, organization ${a.organization_id}). `,
+    data.email
+      ? `Roles will be set by logging in to the portal as ${data.email}. Change the address above if that is not the account's login, then press Continue below.`
+      : "The authority has no contact email. Enter the account's email address above, then press Continue below."),
+    el("dl", { class: "kv" }, capabilityPlanNodes(data.capabilities, "resume-cap-ack"))));
+  startRun(data.run_id, "resume", STEPS, "awaiting_continue");
+  onStatus("awaiting_continue");
+}
+
+// ---------------------------------------------------------- reload recovery
+async function recover(runId) {
+  const { ok, data } = await api(`/api/runs/${runId}`);
+  if (!ok) { history.replaceState(null, "", "#"); return; }
+  const steps = data.kind === "new" ? [{ key: "signup", label: "Sign up" }, ...STEPS] : STEPS;
+  startRun(runId, data.kind, steps, data.status);
+  if (data.form && data.form.email) {
+    $("gate-email").textContent = data.form.email;
+    if (data.kind === "resume") $("resume-email").value = data.form.email;
+  }
+  if (data.email_confirmed) S.gateConfirmed = true;
+  data.events.forEach(applyEvent);
+  onStatus(data.status);
+  if (!QUIET.has(data.status)) openStream();
+}
+
+// ------------------------------------------------------------------ wiring
+function wire() {
+  $("signin-go").addEventListener("click", startSignIn);
+  $("signin-forget").addEventListener("click", signOut);
+  $("signin-har").addEventListener("change", (e) => uploadSavedSignIn(e.target.files[0]));
+  renderSession();
+  // keep "time left" current without asking the server; check with it now and then
+  setInterval(renderSession, 30000);
+  setInterval(refreshSession, 5 * 60 * 1000);
+
+  document.querySelectorAll("input[name=bsource]").forEach((r) => r.addEventListener("change", () => {
+    const mode = boundaryMode();
+    $("by-place").hidden = mode !== "place";
+    $("by-file").hidden = mode !== "file";
+    $("by-account").hidden = mode !== "account";
+    setBoundary(null); show($("place-out")); show($("file-out")); show($("bound-out"));
+    $("f-place").value = ""; $("f-file").value = ""; $("bound-source").value = ""; lastQuery = null;
+  }));
+  $("place-lookup").addEventListener("click", () => lookupPlace($("f-place").value));
+  $("f-place").addEventListener("keydown", (e) => { if (e.key === "Enter") lookupPlace($("f-place").value); });
+  $("f-place").addEventListener("blur", () => {
+    const q = $("f-place").value.trim();
+    if (q && q !== lastQuery) lookupPlace(q);
+  });
+  $("f-file").addEventListener("change", (e) => uploadBoundary(e.target.files[0]));
+  document.querySelectorAll("input[name=csource]").forEach((r) => r.addEventListener("change", () => {
+    $("caps-copy").hidden = capabilityMode() !== "copy";
+    setCapture(null); show($("cap-out")); invalidatePreview();
+  }));
+  $("cap-find").addEventListener("click", () => findCapabilitySource());
+  $("bound-find").addEventListener("click", () => findBoundarySource());
+  $("bound-source").addEventListener("keydown", (e) => { if (e.key === "Enter") findBoundarySource(); });
+  updateBoundFind();
+  $("cap-source").addEventListener("keydown", (e) => { if (e.key === "Enter") findCapabilitySource(); });
+  updateCapFind();
+  $("f-country").addEventListener("change", () => loadStates($("f-country").value.trim()));
+  for (const f of FIELDS) $(`f-${f}`).addEventListener("input", invalidatePreview);
+
+  $("preview").addEventListener("click", doPreview);
+  $("create").addEventListener("click", doCreate);
+  $("gate-clicked").addEventListener("change", updateContinue);
+  $("gate-confirm").addEventListener("click", confirmLink);
+  $("continue").addEventListener("click", () => doContinue());
+  $("resume-toggle").addEventListener("click", () => { $("resume").hidden = !$("resume").hidden; });
+  $("resume-find").addEventListener("click", findAuthority);
+}
+
+async function init() {
+  wire();
+  refreshSession();
+  const { data } = await api("/api/status");
+  STEPS = data.steps || [];
+  showPlaceLookupState(data);
+  const match = location.hash.match(/run=([0-9a-f]+)/);
+  if (match) recover(match[1]);
+}
+
+async function showPlaceLookupState(status) {
+  const note = $("place-lookup-state");
+  if (status.place_lookup === "loading" || status.place_lookup === "not loaded") {
+    note.textContent = "Loading Census data. The first time, this downloads it and can take a minute.";
+    setTimeout(async () => showPlaceLookupState((await api("/api/status")).data), 3000);
+  } else if (status.place_lookup === "unavailable") {
+    note.textContent = `Place lookup isn't available here (${status.place_problem}). Upload a .geojson file instead.`;
+  } else {
+    note.textContent = "";
+  }
+}
+
+init();
+</script>
+</body>
+</html>

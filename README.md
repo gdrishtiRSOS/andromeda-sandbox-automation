@@ -1,431 +1,164 @@
-# RapidSOS Sandbox Account Tooling
+# Sandbox Account Page
 
-Automates the RapidSOS Unite sandbox account runbook: creates the account,
-attaches a jurisdiction boundary, publishes the revision that activates it,
-adds an integration, applies a standard capability set, and enables the
-portal's data sources.
+A web page that creates a RapidSOS Unite sandbox account. You fill in one form,
+confirm your email, and it does the rest: account details, jurisdiction
+boundary, revision, integration, capabilities, and portal Role & Access.
 
-All eight runbook steps are covered. The only manual action left is clicking
-the confirmation link in the sign-up email, which can only be done by whoever
-owns the inbox.
+It runs on your own computer. Nothing is hosted, and nobody else can reach it.
 
-This README covers the command line (`smoke_test.py`). For the web page, which
-runs the same steps from one form, see [README-web.md](README-web.md).
+For the command-line version, see [README.md](README.md).
 
 ---
 
-## Setup
+## One-time setup
 
-```
-project/
-├── smoke_test.py
-├── ecc_lookup.py                  # only for --place lookups
-├── requirements.txt
-├── src/
-│   └── logic/                     # the package: `import logic`
-│       ├── auth.py            browser_auth.py   tokens.py
-│       ├── authorities.py     capabilities.py   integrations.py
-│       ├── jurisdictions.py   places.py         revisions.py
-│       ├── roles.py           signup.py         workflows.py
-│       └── data/
-│           ├── standard_capabilities.json
-│           └── *.geojson              # boundary files
-├── webapp/                        # the web page -- see README-web.md
-└── tests/
-```
+Someone comfortable with a terminal does this once per computer.
 
-```powershell
-python -m pip install -r requirements.txt
-python -m playwright install chromium    # only for --stage session --sign-in
-python -m pytest tests -q                # expect: all passed
-```
+1. Install **Python 3.9 or newer** from python.org. On Windows, tick
+   **Add Python to PATH** in the installer.
+2. From the project folder, run:
 
-Tested on Python 3.9.
+   ```powershell
+   python -m pip install -r requirements.txt
+   python -m playwright install chromium
+   python -m pytest tests -q        # expect: all passed
+   ```
 
-Run every command from the project root. Re-run the tests after copying files
-in — they import every module and catch a half-updated checkout instantly.
+You don't need to paste a token. The page signs in to Andromeda for you (see
+below), and it logs in to the portal as the new account itself.
 
-### Tokens
+---
 
-Three different situations:
+## Starting it
 
-| Stage | Token |
+Double-click **`start.bat`** on Windows, or **`start.sh`** on Mac/Linux.
+
+A terminal window opens, and then your browser opens at
+`http://127.0.0.1:8765/`. **Leave the terminal window open** while you use the
+page. Closing it stops the app.
+
+If the window says *"Some pieces are not installed yet"*, run the command it
+prints, or redo the one-time setup.
+
+If port 8765 is already in use, set `SANDBOX_UI_PORT` to another number before
+starting.
+
+---
+
+## Using the page
+
+### 1. Sign in
+
+Press **Sign in to Andromeda**. The first time, a browser window opens: sign
+in with your RapidSOS Google account, then come back to the page. After that,
+signing in finishes on its own in a few seconds. A sign-in lasts about a day.
+
+You only need to sign in before the later steps. Creating the account itself
+doesn't need it.
+
+**Without Playwright**, the page offers a fallback: record a sign-in in Chrome
+DevTools (Network tab, **Preserve log**), save it with **Save all as HAR with
+content**, and upload the file. Delete the HAR afterwards, because it holds
+your live sign-in.
+
+### 2. The account
+
+| Field | Notes |
 |---|---|
-| `signup`, `confirm` | **none** — these calls are unauthenticated |
-| `roles` | `--portal-email`, or `RAPIDSOS_PORTAL_TOKEN` (portal API) |
-| everything else | a stored sign-in, or `ANDROMEDA_TOKEN` (Andromeda) |
+| Email | Must never have been used before. Add a `+tag` per account, e.g. `you+authority@rapidsos.com` |
+| First / last name | The contact on the account |
+| Agency/Authority name | Becomes the authority name in Andromeda. Pick one you'll recognise later |
+| Boundary | A US place (town, city, county or 5-digit GEOID), an uploaded `.geojson` file, or a copy of another account's boundary |
+| Account ID | Optional. Filled in from the place when there is one |
+| Country / state | Filled in from the place. Required otherwise |
+| Capabilities | The standard sandbox set, or a copy of another account's |
 
-**Andromeda: sign in once a day** instead of pasting a token.
+When you look up a place, the page shows the matched county, its ECCs and the
+bounding box before anything is created. **Check the bounding box**: it is the
+quickest way to catch a boundary in the wrong part of the world. If a name
+matches more than one place (for example, "Lincoln, NE" is both a county and
+a city in another county), the page lists the options for you to pick from.
 
-```powershell
-python smoke_test.py --stage session --sign-in
-```
+Press **Preview** to see what will happen. Nothing is written yet. Then press
+**Create**.
 
-A browser window opens. Sign in with Google once; later sign-ins reuse that
-browser profile and finish on their own. The session lasts about a day, and
-every other stage mints its own access token from it.
+### 3. Confirm your email
 
-```powershell
-python smoke_test.py --stage session                        # who, and for how long
-python smoke_test.py --stage session --from-har login.har   # without Playwright
-python smoke_test.py --stage session --forget               # sign out
-```
+The page shows the address it sent the confirmation to. Open that email and
+click the link. Or paste the link into the page and press **Confirm**.
 
-**Portal (roles): log in as the account.** Accounts the tool creates use the
-shared sandbox password, so `--stage roles --portal-email you+tag@rapidsos.com`
-needs nothing pasted.
+### 4. Continue
 
-**Or paste tokens.** Either variable, when set, overrides the above:
+Press **Continue**. The remaining six steps run without further input, and
+each one shows up as it finishes:
 
-```powershell
-$env:ANDROMEDA_TOKEN='eyJhbGciOi...'          # andromeda.sandbox.rapidsos.com
-$env:RAPIDSOS_PORTAL_TOKEN='eyJhbGciOi...'    # api-sandbox.rapidsosportal.com
-```
+1. Account info
+2. Boundary
+3. Publish revision
+4. Integration
+5. Capabilities
+6. Roles
 
-DevTools → click a request → **Headers** → right-click the `authorization`
-value → **Copy value**. Single quotes in PowerShell; double quotes mangle it.
+The whole run takes about a minute. When it's done, check the account in the
+browser: the jurisdiction reads **Active** and the **Alerts tab appears**.
 
-Pasted tokens expire in a few hours. Every run prints how long the token has
-left.
-
-### Three rules
-
-**Nothing is written without `--apply`.** Every stage is a dry run by default
-and prints what it would do.
-
-**`--authority-id` takes a name or a number.** `"Authority123Sandbox"` is looked up.
-Duplicate names are refused rather than guessed at.
-
-**Never create an Authority named with space.** For example `"Authrority 123 Sandbox"` will
-result in an error. The vaild name for this example would be `"Authority123Sandbox"`. 
+Every account the tool creates uses the shared sandbox password, so anyone on
+the team can log into it.
 
 ---
 
-## Creating an account from scratch
-
-```powershell
-# 1. sign up (runbook step 1) -- no token needed
-python smoke_test.py --stage signup `
-  --email "you+authority@rapidsos.com" `
-  --agency-name "Authority123Sandbox" `
-  --first-name Ada --last-name Lovelace --apply
-
-# 2. confirm the address -- click the emailed link, or:
-python smoke_test.py --stage confirm --confirm-token "<the whole link>" --apply
-
-# 3. account details (runbook step 2)
-python smoke_test.py --authority-id "Authority123Sandbox" --stage account-info --account-id SBX_31109 --country USA --state NE --apply
-
-# 4. boundary, revision, integration, capabilities (steps 4, 7, 5, 6)
-python smoke_test.py --authority-id "Authority123Sandbox" --stage provision --geojson lancaster --apply
-
-# 5. portal data sources (step 8)
-python smoke_test.py --authority-id "Authority123Sandbox" --stage roles --portal-email "you+authority@rapidsos.com" --apply
-```
-
-Then check in the browser: the jurisdiction reads **Active**, the capabilities
-are set on the integration, and the **Alerts tab appears**. The tool confirms
-the API accepted everything; only the UI confirms the account works.
-
-Steps 3 and 4 can be replaced by a single `--stage sandbox --place ...` when
-the boundary is a US county — see *From a place name*.
-
----
-
-## Commands
-
-### Sign-up (runbook step 1)
-
-```powershell
-# dry run
-python smoke_test.py --stage signup --email "you+authority@rapidsos.com" --agency-name "Authority123Sandbox" --first-name Ada --last-name Lovelace
-
-# create it
-python smoke_test.py --stage signup --email "you+lancaster@rapidsos.com" --agency-name "Authority123Sandbox" --first-name Ada --last-name Lovelace --apply
-
-# confirm the address
-python smoke_test.py --stage confirm --confirm-token "<link or token>" --apply
-```
-
-Notes:
-
-- **The agency name becomes the authority name** in Andromeda. Choose it as
-  you want to find it later.
-- Every generated account gets the password `AutomatedAccount123!`, so anyone
-  on the team can log into one. `--password` overrides.
-- **Addresses cannot be reused.** A second account needs a different `+tag`.
-- The PSAP call answers **500 but the data lands** — confirmed against a real
-  signup. The tool tolerates it and says so. A 4xx still fails, because that
-  means the payload was wrong.
-- `--confirm-token` accepts the raw token or the whole URL from the email.
-- Contact title, phone, population and the three "Other" system fields are
-  filled with the runbook's fixed values automatically.
-
-### Account Info (runbook step 2)
-
-```powershell
-# what codes exist
-python smoke_test.py --authority-id "Authority123Sandbox" --stage catalogs
-python smoke_test.py --authority-id "Authority123Sandbox" --stage catalogs --country GBR
-
-# read the current values
-python smoke_test.py --authority-id "Authority123Sandbox" --stage account-info
-
-# set them
-python smoke_test.py --authority-id "Authority123Sandbox" --stage account-info --account-id SBX_0001 --country GBR --state WMD --apply
-```
-
-`--dispatch-type` defaults to `1` (Primary), which every sandbox account needs,
-so it is set on every account-info and sandbox run without being asked for.
-
-`account_id` can only be set **once**. If it already holds a value the tool
-warns, skips that field, and applies the rest.
-
-### From a place name (US counties only)
-
-Resolves a town, city or county to its Census county boundary and derives the
-account fields from it. Needs `ecc_lookup.py` and geopandas.
-
-```powershell
-# resolve only -- no writes
-python smoke_test.py --authority-id "Authority123Sandbox" --stage place --place "Lancaster County, NE"
-python smoke_test.py --authority-id "Authority123Sandbox" --stage place --place 31109
-
-# account info + boundary + revision + integration + capabilities
-python smoke_test.py --authority-id "Authority123Sandbox" --stage sandbox --place "Lancaster County, NE" --apply
-
-# name the authority after the registered ECC
-python smoke_test.py --authority-id "Authority123Sandbox" --stage sandbox --place 31109 --use-ecc-name --apply
-
-# proceed even when the FCC registry lists no ECCs for the county
-python smoke_test.py --authority-id "Authority123Sandbox" --stage sandbox --place 31109 --allow-unverified-scope --apply
-```
-
-A query matching both a county and a city in **different** counties is
-refused: "Lincoln, NE" is both Lincoln County and the city of Lincoln, which
-sits in Lancaster County. Name the county, or pass the 5-digit GEOID.
-
-### Everything after the account exists (steps 4, 7, 5, 6)
-
-```powershell
-# dry run
-python smoke_test.py --authority-id "Authority123Sandbox" --stage provision --geojson my-boundary
-
-# boundary → revision → integration → capabilities
-python smoke_test.py --authority-id "Authority123Sandbox" --stage provision --geojson my-boundary --apply
-
-# a different capability set
-python smoke_test.py --authority-id "Authority123Sandbox" --stage provision --geojson my-boundary --standard src/logic/data/other.json --apply
-
-# the boundary is already live
-python smoke_test.py --authority-id "Authority123Sandbox" --stage provision --skip-jurisdiction --apply
-
-# fail rather than continue if the jurisdiction never reaches Active
-python smoke_test.py --authority-id "Authority123Sandbox" --stage provision --geojson my-boundary --require-active --apply
-```
-
-### Jurisdiction boundary (runbook steps 4 and 7)
-
-```powershell
-# list the boundary files available
-python smoke_test.py --authority-id "Authority123Sandbox" --stage jurisdiction
-
-# dry run
-python smoke_test.py --authority-id "Authority123Sandbox" --stage jurisdiction --geojson shapefile
-
-# create AND publish the revision that activates it
-python smoke_test.py --authority-id "Authority123Sandbox" --stage jurisdiction --geojson shapefile --apply
-
-# create only, publish later
-python smoke_test.py --authority-id "Authority123Sandbox" --stage jurisdiction --geojson my-boundary --apply --no-activate
-
-# a file from outside the data folder
-python smoke_test.py --authority-id "Authority123Sandbox" --stage jurisdiction --geojson C:\path\to\boundary.geojson --apply
-```
-
-Check the printed bbox before applying. It is the one line that catches a
-boundary in the wrong part of the world.
-
-### Copying a boundary from another account
-
-```powershell
-# writes src/logic/data/authority-<id>.geojson
-python smoke_test.py --authority-id "SomeOtherAccount" --stage export-boundary
-
-# choose the filename
-python smoke_test.py --authority-id "SomeOtherAccount" --stage export-boundary --out src/logic/data/shapefile.geojson
-
-# when the authority has more than one jurisdiction
-python smoke_test.py --authority-id "SomeOtherAccount" --stage export-boundary --jurisdiction-id 3799
-```
-
-Read-only, and the file round-trips without editing. Boundaries carry no
-environment-specific names, so a production boundary transfers to sandbox
-unchanged — add `--base-url` and a token for that environment.
-
-### Publishing a revision (runbook step 7)
-
-```powershell
-# what is waiting to be published -- read-only
-python smoke_test.py --authority-id "Authority123Sandbox" --stage pending
-
-# dry run, then publish
-python smoke_test.py --authority-id "Authority123Sandbox" --stage activate
-python smoke_test.py --authority-id "Authority123Sandbox" --stage activate --apply
-
-# pick the revision number yourself
-python smoke_test.py --authority-id "Authority123Sandbox" --stage activate --revision-number 2409 --revision-date 2026-09-24 --apply
-
-# publish even though someone else's changes are in the batch
-python smoke_test.py --authority-id "Authority123Sandbox" --stage activate --allow-other-authorities --apply
-```
-
-**Revisions are environment-wide.** The pending revision batches every
-authority's jurisdiction changes, and publishing activates all of them. The
-tool refuses when the batch holds another authority — see *Working as a team*.
-
-Revision numbers must be unique. The default is day + month; on a collision
-the tool retries with a suffix (2409 → 240901) rather than failing.
-
-### Integrations (runbook step 5)
-
-```powershell
-python smoke_test.py --authority-id "Authority123Sandbox" --stage create
-python smoke_test.py --authority-id "Authority123Sandbox" --stage create --apply
-
-# override the name or product
-python smoke_test.py --authority-id "Authority123Sandbox" --stage create --app-name "Authority123 Demo" --apply
-python smoke_test.py --authority-id "Authority123Sandbox" --stage create --product "RapidSOS Portal" --apply
-
-# reuse an existing integration of the same name instead of failing
-python smoke_test.py --authority-id "Authority123Sandbox" --stage create --if-exists reuse --apply
-```
-
-`consumer_secret` is printed once, at creation, and never again. Store it if
-anything downstream needs it.
-
-### Capabilities (runbook step 6)
-
-These need `--integration-id`.
-
-```powershell
-# read the current state and snapshot it
-python smoke_test.py --authority-id "Authority123Sandbox" --integration-id 13909 --stage read
-
-# what would change
-python smoke_test.py --authority-id "Authority123Sandbox" --integration-id 13909 --stage plan
-
-# apply
-python smoke_test.py --authority-id "Authority123Sandbox" --integration-id 13909 --stage apply --apply
-
-# a different capability file
-python smoke_test.py --authority-id "Authority123Sandbox" --integration-id 13909 --standard src/logic/data/other.json --stage apply --apply
-
-# does it still match?
-python smoke_test.py --authority-id "Authority123Sandbox" --integration-id 13909 --stage verify
-
-# undo
-python smoke_test.py --authority-id "Authority123Sandbox" --integration-id 13909 --restore snapshots\13909-20260924-162432-before.json --apply
-```
-
-Alerts capabilities cannot be enabled where the jurisdiction overlaps one that
-already has them; Andromeda answers 500. The tool retries without them and
-reports which were skipped.
-
-Capability names differ between environments (`lyft` vs `lyft_sandbox`), so a
-production capability file does **not** apply cleanly to a sandbox
-integration.
-
-### Role and Access (runbook step 8)
-
-Runs against the **portal** API, so it needs `--portal-email` (logs in as the
-account) or `RAPIDSOS_PORTAL_TOKEN`.
-
-```powershell
-# log in as the account instead of pasting a token
-python smoke_test.py --authority-id "Authority123Sandbox" --stage roles --portal-email "you+authority@rapidsos.com" --apply
-
-# dry run -- also writes a snapshot
-python smoke_test.py --authority-id "Authority123Sandbox" --stage roles
-
-# grant every data source to Admin and Agent
-python smoke_test.py --authority-id "Authority123Sandbox" --stage roles --apply
-
-# undo
-python smoke_test.py --authority-id "Authority123Sandbox" --stage roles --restore-roles snapshots\roles-15516-...-before.json --apply
-
-# a different organization
-python smoke_test.py --authority-id "Authority123Sandbox" --stage roles --organization-id 15516 --apply
-```
-
-Admin gets every permission; Agent gets every permission except the
-administrative ones. Derived from the catalog, so new permissions are picked
-up automatically.
-
-Without this step the capabilities exist in Andromeda but the data sources are
-off in the portal, so the Alerts tab stays empty.
-
-If the dry run reports **revocations**, stop. A role holding something outside
-the target set means an assumption is wrong.
-
-## Other notes
-**The web page and the CLI share the sign-in.** Both use
-`.andromeda-session.json` and `.andromeda-browser/`, so signing in through
-either works for both. The profile is for one Google account: to sign in as
-someone else, delete `.andromeda-browser/` and `.andromeda-session.json`.
-See [README-web.md](README-web.md) for the page.
+## Messages that are not problems
+
+The page reports these, but they don't mean anything went wrong:
+
+- **PSAP creation returned 500.** This is expected. The data lands anyway.
+- **Alerts capabilities skipped.** The boundary overlaps another account that
+  already has alerts, and Andromeda won't allow both. Everything else applies.
+- **Account ID skipped.** It can only be set once, and it already has a value.
+  The other fields still apply.
 
 ---
 
 ## When something goes wrong
 
-**401** — the token expired. Run `--stage session --sign-in` again, or paste
-a fresh one. The tool prints how long a token has left before every run.
+**The page refuses to publish the revision.** Publishing a revision activates
+*every* authority's pending jurisdiction changes, not just yours. If someone
+else has work waiting, the page names them and stops. Ask them in Slack, and
+try again once their changes are published. The page can't override this.
 
-**400 on register, `{"password": ["Invalid value."]}`** — the API enforces
-undocumented complexity rules. The built-in password satisfies them; only a
-custom `--password` can hit this.
+**"Another run is already writing."** Only one run can write at a time,
+because two would collide on the same revision. Wait for the other run to
+finish.
 
-**400 on register, address in use** — addresses cannot be reused. Use a
-different `+tag`.
+**A step failed partway through.** The page lists what already exists and
+what doesn't. Fix the cause, then use **Resume an existing account** (the link
+at the top of the page). Resuming finds the authority by name, detects the
+steps that are already done, and skips them.
 
-**500 on the PSAP call** — expected. The data lands anyway; verify the
-authority in Andromeda.
+**You closed the tab while checking your email.** Use **Resume an existing
+account** with the agency name you entered. You don't need to start again,
+and you can't anyway, because the email address can't be reused.
 
-**500 on capabilities** — alerts against an overlapping jurisdiction.
-Expected; the tool retries without them.
+**Sign-in expired.** Press **Sign in to Andromeda** again.
 
-**`Cannot update Account ID once set`** — handled. The tool skips that field
-and applies the rest.
-
-**`ModuleNotFoundError: ecc_lookup`** — put `ecc_lookup.py` at the project
-root and run from there. Only `--place` needs it.
-
-**`ModuleNotFoundError`** for anything else — run
-`python -m pip install -r requirements.txt`.
-
-**`AmbiguousPlaceError`** — the query matches more than one place. Use the
-county name or the GEOID.
-
-**`PartialProvisionError`** — a step failed after earlier ones succeeded. The
-message lists what completed so a retry can skip it, usually with
-`--skip-jurisdiction`.
-
-**Anything unexpected** — every run writes a snapshot to `snapshots/`, and
-both `--restore` and `--restore-roles` put things back.
+**You want to undo capabilities or roles.** Both are snapshotted before
+they're written. At the end of a run, **Undo capabilities** and **Undo roles**
+show what the undo would change before asking you to confirm.
 
 ---
 
-## What is not automated
+## Sign-in files: never share them
 
-**Clicking the confirmation link.** The token is a server-signed JWT that only
-exists in the email, so it cannot be generated. Paste the link into
-`--stage confirm` or click it — either way a human with inbox access is
-needed.
+Signing in creates two files in the project folder:
 
-**Deleting accounts.** There is no teardown path. Generated accounts
-accumulate.
+- `.andromeda-session.json`: your Andromeda sign-in
+- `.andromeda-browser/`: the browser profile, holding your Google session
 
-**Unattended running.** Andromeda signs in through Google, and the stored
-session lasts about a day, so someone has to sign in each day. A service
-account would be needed to run this on a schedule.
+Both are **your** credentials. They are gitignored. Never commit, copy or send
+them. **Sign out** forgets the Andromeda sign-in but keeps the browser
+profile, so the next sign-in is the same Google account again. To sign in as
+someone else, stop the app and delete both.
+
+If `ANDROMEDA_TOKEN` is set in the environment when the app starts, the app
+uses that token instead of the sign-in. It can't be renewed, so when it
+expires, set a fresh one and restart.

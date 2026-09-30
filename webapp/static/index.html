@@ -9,7 +9,12 @@
     1. Sign-in   -- Andromeda, through a browser window the app opens; the server
                     keeps the session and this page only learns who and for how
                     long. The portal side logs in as the new account by itself
-    2. Account   -- the form: who, which agency, which boundary; Preview, Create
+    2. Account   -- one of two cards, chosen at the top:
+                    Create:   the form: who, which agency, which boundary; Preview, Create
+                    Existing: look an account up, see what it has, tick what to
+                              change; Preview, then Apply after a second confirmation
+                    The boundary and capabilities pickers are one set of widgets,
+                    moved into whichever card is showing.
     3. Progress  -- steps streamed from the server (Server-Sent Events), the
                     email gate between the phases, and the outcome
   All the logic that matters lives in the Python package; this page only asks
@@ -97,10 +102,17 @@
 </head>
 <body>
 <main>
-  <h1>Create a RapidSOS sandbox account</h1>
-  <p class="lede">Fill in the form, press <b>Preview</b>, then <b>Create</b>. You'll be asked
-    to confirm your email address; after that, press <b>Continue</b> and the rest runs by itself.
-    <button class="link" id="resume-toggle">Resume an existing account instead</button></p>
+  <h1>RapidSOS sandbox accounts</h1>
+  <div class="radio-row" style="margin-top:8px">
+    <label><input type="radio" name="mode" value="create" checked> Create a new account</label>
+    <label><input type="radio" name="mode" value="existing"> Work on an existing account</label>
+  </div>
+  <p class="lede" id="lede-create">Fill in the form, press <b>Preview</b>, then <b>Create</b>. You'll be asked
+    to confirm your email address; after that, press <b>Continue</b> and the rest runs by itself.</p>
+  <p class="lede" id="lede-existing" hidden>Look up an account, see what it has, and tick what
+    to change. <b>Preview</b> shows every change before anything is written, and <b>Apply</b>
+    asks you to confirm. If an account's setup stopped part-way, look it up and press
+    <b>Resume setup</b>.</p>
 
   <!-- ====================================================== 1. sign-in -->
   <section class="card" id="signin">
@@ -178,7 +190,7 @@
         <input type="email" id="f-email" placeholder="you+authority@rapidsos.com">
         <div class="field-error" data-error="email"></div></div>
       <div class="field"><label for="f-agency_name">Agency/Authority name </label>
-        <input id="f-agency_name" placeholder="Lancaster County NE Sandbox">
+        <input id="f-agency_name" placeholder="Authority123Sandbox">
         <div class="field-error" data-error="agency_name"></div></div>
       <div class="field"><label for="f-first_name">First name</label>
         <input id="f-first_name"><div class="field-error" data-error="first_name"></div></div>
@@ -187,6 +199,7 @@
     </div>
 
     <h3>Boundary</h3>
+    <div id="boundary-home"><div id="boundary-picker">
     <div class="radio-row">
       <label><input type="radio" name="bsource" value="place" checked> A US place</label>
       <label><input type="radio" name="bsource" value="file"> A .geojson file</label>
@@ -212,10 +225,11 @@
       <div id="bound-out"></div>
     </div>
     <div class="field-error" data-error="boundary"></div>
+    </div></div>
 
     <div class="grid" style="margin-top:14px">
       <div class="field"><label for="f-account_id">Account ID <span class="hint">optional</span></label>
-        <input id="f-account_id" placeholder="SAND_31109"></div>
+        <input id="f-account_id" placeholder="SAND_1234"></div>
       <div class="field"><label for="f-country">Country</label>
         <input id="f-country" list="countries" placeholder="USA">
         <datalist id="countries"></datalist>
@@ -229,8 +243,9 @@
       edit them.</p>
 
     <h3>Capabilities</h3>
+    <div id="caps-home"><div id="caps-picker">
     <div class="radio-row">
-      <label><input type="radio" name="csource" value="default" checked> The standard sandbox set (Boiler911)</label>
+      <label><input type="radio" name="csource" value="default" checked> Boiler911 capabilities</label>
       <label><input type="radio" name="csource" value="copy"> Copy from an existing account</label>
     </div>
     <div id="caps-copy" hidden>
@@ -242,12 +257,99 @@
       <div id="cap-out"></div>
     </div>
     <div class="field-error" data-error="capabilities"></div>
+    </div></div>
 
     <div class="actions">
       <button type="button" id="preview">Preview</button>
       <button type="button" class="primary" id="create" disabled>Create</button>
     </div>
     <div id="preview-out"></div>
+  </section>
+
+  <!-- ====================================================== 2. existing account -->
+  <section class="card" id="existing" hidden>
+    <h2><span class="num">2</span> The account</h2>
+    <div class="field">
+      <label for="x-authority">Authority name or id <span class="hint">needs the Andromeda sign-in</span></label>
+      <div class="row"><input id="x-authority">
+        <button type="button" id="x-find">Look up</button></div>
+    </div>
+    <div id="x-find-out"></div>
+
+    <div id="x-body" hidden>
+      <h3>What it has</h3>
+      <div id="x-overview"></div>
+      <div class="field">
+        <label for="x-email">Account email <span class="hint">the app logs in to the portal as this
+          account to read and set its roles. Filled in from the authority.</span></label>
+        <div class="row"><input type="email" id="x-email">
+          <button type="button" id="x-email-check">Check</button></div>
+      </div>
+      <div class="actions" style="margin-top:0">
+        <button type="button" id="x-resume">Resume setup</button>
+        <span class="hint">For an account whose setup stopped part-way. Steps already done are
+          detected and skipped.</span>
+      </div>
+
+      <h3>What to change</h3>
+      <p class="hint" style="margin-top:0">Tick only what you want changed. Everything else is
+        left as it is.</p>
+
+      <div class="field">
+        <label style="font-weight:600"><input type="checkbox" id="x-t-account_info"> Account details</label>
+        <div id="x-s-account_info" hidden>
+          <p class="hint">Change the fields you want. A field left as it is is not sent, and a
+            field can't be cleared here.</p>
+          <div class="grid" id="x-fields"></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label style="font-weight:600"><input type="checkbox" id="x-t-boundary"> Add a jurisdiction</label>
+        <div id="x-s-boundary" hidden>
+          <div class="box warn">Adding a jurisdiction also <b>publishes a revision</b>, and
+            publishing is environment-wide: it activates every authority's pending
+            jurisdiction changes. If anyone else has work waiting, Preview refuses and names
+            them. The account's existing jurisdictions are not changed.</div>
+          <div id="x-boundary-slot"></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label style="font-weight:600"><input type="checkbox" id="x-t-integration"> Add an integration</label>
+        <div id="x-s-integration" hidden>
+          <p class="hint">A new <b>RapidSOS Portal</b> integration, named like the others
+            (<i>agency</i> Sandbox RSP <i>date</i>) and numbered if that name is taken.
+            Integrations can only be added, not edited.</p>
+        </div>
+      </div>
+
+      <div class="field">
+        <label style="font-weight:600"><input type="checkbox" id="x-t-capabilities"> Capabilities</label>
+        <div id="x-s-capabilities" hidden>
+          <p class="hint" style="margin-bottom:4px">Which integration:</p>
+          <div id="x-cap-targets"></div>
+          <p class="hint" style="margin-bottom:4px">Which capabilities:</p>
+          <div id="x-caps-slot"></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label style="font-weight:600"><input type="checkbox" id="x-t-roles"> Role &amp; Access</label>
+        <div class="hint" id="x-roles-why"></div>
+        <div id="x-s-roles" hidden>
+          <p class="hint">Gives the Admin and Agent roles every data source, as when an account
+            is created. A change that would take a permission away is refused.</p>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button type="button" id="x-preview">Preview</button>
+        <button type="button" class="primary" id="x-apply" disabled>Apply</button>
+      </div>
+      <div id="x-preview-out"></div>
+      <div id="x-confirm"></div>
+    </div>
   </section>
 
   <!-- ====================================================== 3. progress -->
@@ -500,7 +602,7 @@ function invalidatePreview() {
   show($("preview-out"), el("p", { class: "muted" }, "The form changed. Press Preview again."));
 }
 
-function setBoundary(id) { S.boundaryId = id; invalidatePreview(); }
+function setBoundary(id) { S.boundaryId = id; invalidatePreview(); invalidateChanges(); }
 
 /** Which of the three sources of geometry is chosen. Only ever one. */
 function boundaryMode() {
@@ -596,7 +698,7 @@ function capabilityMode() {
   return document.querySelector("input[name=csource]:checked").value;
 }
 
-function setCapture(id) { S.captureId = id; invalidatePreview(); }
+function setCapture(id) { S.captureId = id; invalidatePreview(); invalidateChanges(); }
 
 /** Find needs the Andromeda sign-in; say so rather than letting it fail. */
 function updateCapFind() {
@@ -881,7 +983,7 @@ function onStatus(status) {
   S.runStatus = status;
   $("gate").hidden = !(status === "awaiting_email");
   $("continue-box").hidden = !["awaiting_email", "awaiting_continue"].includes(status);
-  if (status === "configuring") { show($("outcome")); show($("continue-out")); }
+  if (status === "configuring" || status === "applying") { show($("outcome")); show($("continue-out")); }
   updateContinue();
   if (QUIET.has(status) && S.stream) { S.stream.close(); S.stream = null; }
 }
@@ -976,6 +1078,15 @@ function renderFailure(ev) {
         onclick: () => { $("resume-authority").value = String(c.id); $("resume").hidden = false; findAuthority(); } },
         `id ${c.id}`), ` ${c.name} · account ID ${c.account_id || "none"} · organization ${c.organization_id}`))));
   }
+  if (S.runKind === "change") {
+    parts.push(el("div", { class: "actions" },
+      el("button", { type: "button", class: "primary", onclick: () => lookAgain(ev) }, "Look the account up again"),
+      el("span", { class: "hint" }, "See what it has now, tick what is still to do, and preview again.")));
+    parts.push(undoButtons(ev.snapshots || []));
+    $("x-preview").disabled = false;
+    show($("outcome"), el("div", { class: `box ${ev.refused ? "warn" : "bad"}` }, parts));
+    return;
+  }
   if (S.runKind === "new" && ev.step === "signup") {
     parts.push(el("p", { class: "muted" }, "Change the form and press Preview to try again."));
     $("preview").disabled = false;
@@ -991,6 +1102,19 @@ function renderFailure(ev) {
 function renderSuccess(ev) {
   const skipped = (ev.notes || []);
   const integ = ev.integration;
+  if (S.runKind === "change") {
+    $("x-preview").disabled = false;
+    show($("outcome"), el("div", { class: "box ok" },
+      el("h3", {}, `✓ Changes applied to ${ev.authority.name}`),
+      ev.existing.length ? [el("b", {}, "Written"), list(ev.existing)]
+                         : el("p", {}, "Nothing needed writing: the account already matched."),
+      integ && integ.consumer_secret ? secretBlock(integ) : null,
+      skipped.length ? [el("b", {}, "Skipped, and why (expected, not problems)"), list(skipped)] : null,
+      el("div", { class: "actions" },
+        el("button", { type: "button", onclick: () => lookAgain(ev) }, "Look the account up again")),
+      undoButtons(ev.snapshots || [])));
+    return;
+  }
   show($("outcome"), el("div", { class: "box ok" },
     el("h3", {}, "✓ The sandbox account is ready"),
     el("dl", { class: "kv" },
@@ -1022,9 +1146,11 @@ function secretBlock(integ) {
 }
 
 // --- undo: always a preview of the undo first, then an explicit confirm
-function undoButtons() {
+function undoButtons(kinds = ["capabilities", "roles"]) {
   const holder = el("div", { id: "undo" });
-  const buttons = [["capabilities", "Undo capabilities"], ["roles", "Undo roles"]].map(([kind, label]) =>
+  if (!kinds.length) return holder;
+  const buttons = [["capabilities", "Undo capabilities"], ["roles", "Undo roles"]]
+    .filter(([kind]) => kinds.includes(kind)).map(([kind, label]) =>
     el("button", { type: "button", onclick: () => previewUndo(kind, holder) }, label));
   holder.append(el("div", { class: "actions" }, buttons,
     el("span", { class: "hint" }, "Puts back the snapshot taken just before each was written.")));
@@ -1096,11 +1222,320 @@ async function findAuthority() {
   onStatus("awaiting_continue");
 }
 
+// ------------------------------------------------- work on an existing account
+// Look the account up, show what it has, tick what to change. Preview writes
+// nothing; Apply needs a second confirmation, and the server re-checks the
+// account before writing and refuses if it moved since the preview.
+let CHANGE_STEPS = [];      // filled from /api/status
+const NEW_INTEGRATION = "new";
+const X = { overview: null, roles: null, runId: null, plan: null };
+const ACCOUNT_FIELDS = [
+  ["account_id", "Account ID"], ["country", "Country"], ["state", "State"],
+  ["contact_name", "Contact name"], ["contact_email", "Contact email"],
+  ];
+const TICKS = ["account_info", "boundary", "integration", "capabilities", "roles"];
+
+function mode() { return document.querySelector("input[name=mode]:checked").value; }
+
+/** Show one card or the other, and move the shared pickers into it. */
+function setMode(m) {
+  document.querySelector(`input[name=mode][value=${m}]`).checked = true;
+  const existing = m === "existing";
+  $("account").hidden = existing; $("lede-create").hidden = existing;
+  $("existing").hidden = !existing; $("lede-existing").hidden = !existing;
+  if (existing) $("resume").hidden = true;
+  (existing ? $("x-boundary-slot") : $("boundary-home")).append($("boundary-picker"));
+  (existing ? $("x-caps-slot") : $("caps-home")).append($("caps-picker"));
+  document.querySelector("input[name=bsource][value=place]").checked = true;
+  document.querySelector("input[name=csource][value=default]").checked = true;
+  onBoundarySource();
+  onCapabilitySource();
+}
+
+/** Anything that changes what would be applied invalidates the last preview. */
+function invalidateChanges() {
+  if (!X.runId) return;
+  X.runId = null; X.plan = null;
+  $("x-apply").disabled = true;
+  show($("x-confirm"));
+  show($("x-preview-out"), el("p", { class: "muted" }, "Something changed. Press Preview again."));
+}
+
+async function findExisting(query) {
+  query = String(query || $("x-authority").value).trim();
+  const out = $("x-find-out");
+  if (!query) return;
+  if (!signedIn()) { needSignIn(out, "Sign in to Andromeda at the top of the page first. The account is read from Andromeda."); return; }
+  $("x-body").hidden = true;
+  X.overview = null; X.roles = null;
+  invalidateChanges();
+  show($("x-preview-out"));
+  show(out, el("p", { class: "muted" }, "Reading the account…"));
+  const { status, data } = await api(`/api/accounts?authority=${encodeURIComponent(query)}`);
+  if (status === 409 && data.kind === "ambiguous") {       // a choice, never made for them
+    show(out, el("div", { class: "box warn" }, el("div", {}, data.message, " Choose one:"),
+      data.candidates.map((c) => el("div", {}, el("button", { type: "button",
+        onclick: () => { $("x-authority").value = String(c.id); findExisting(String(c.id)); } }, `Use id ${c.id}`),
+        ` ${c.name} · account ID ${c.account_id || "none"} · organization ${c.organization_id}`))));
+    return;
+  }
+  if (status === 400 && data.kind === "session") { needSignIn(out, data.error); return; }
+  if (status !== 200) {
+    const near = data.near && data.near.length ? ` Did you mean: ${data.near.join(", ")}?` : "";
+    show(out, el("div", { class: "box bad" }, (data.message || data.error || `Failed (${status})`) + near));
+    return;
+  }
+  show(out);
+  X.overview = data;
+  $("x-email").value = data.email || "";
+  for (const k of TICKS) { $(`x-t-${k}`).checked = false; $(`x-s-${k}`).hidden = true; }
+  fillAccountFields(data);
+  renderOverview();
+  renderCapTargets();
+  $("x-body").hidden = false;
+  loadRoles();
+}
+
+function renderOverview() {
+  const o = X.overview, a = o.authority;
+  const jurisdictions = o.jurisdictions.length
+    ? o.jurisdictions.map((j) => `${j.id} · ${j.status} · ${j.shapes} shape(s)`) : ["none"];
+  const integrations = o.integrations.length
+    ? o.integrations.map((i) => `${i.app_name} (id ${i.id}, ${i.product || "unknown product"}) · ` +
+        `${i.enabled} of ${i.total} capabilities enabled for the authority, ${i.rsos_enabled} by RapidSOS`)
+    : ["none"];
+  const others = Object.entries(o.pending.others);
+  const batch = others.length
+    ? el("span", { class: "warn" }, "⚠ holds pending work for " +
+        others.map(([id, name]) => `${name} (id ${id})`).join(", ") + ". Adding a jurisdiction will be refused until it is published.")
+    : el("span", { class: "ok" }, "✓ nobody else's work is waiting" +
+        (o.pending.mine.length ? `; this account's jurisdiction(s) ${o.pending.mine.join(", ")} are waiting` : ""));
+  show($("x-overview"), el("dl", { class: "kv" },
+    el("dt", {}, "Authority"), el("dd", {}, `${a.name} (id ${a.id}), organization ${a.organization_id || "none"}`),
+    el("dt", {}, "Account ID"), el("dd", {}, a.account_id || "not set",
+      o.account_id_locked ? el("span", { class: "hint" }, "  set once; Andromeda refuses to change it") : null),
+    el("dt", {}, "Country / state"), el("dd", {}, `${o.fields.country || "?"} / ${o.fields.state || "?"}`),
+    el("dt", {}, "Jurisdictions"), el("dd", {}, list(jurisdictions)),
+    el("dt", {}, "Integrations"), el("dd", {}, list(integrations)),
+    el("dt", {}, "Roles"), el("dd", { id: "x-roles" }, el("span", { class: "muted" }, "Logging in to the portal…")),
+    el("dt", {}, "Revision batch"), el("dd", {}, batch)));
+}
+
+function fillAccountFields(o) {
+  show($("x-fields"), ...ACCOUNT_FIELDS.map(([k, label]) => {
+    const current = o.fields[k] === null || o.fields[k] === undefined ? "" : String(o.fields[k]);
+    const locked = k === "account_id" && o.account_id_locked;
+    const input = el("input", { id: `x-f-${k}`, value: current, "data-current": current, disabled: locked,
+                                list: k === "country" ? "countries" : k === "state" ? "states" : null,
+                                oninput: invalidateChanges });
+    if (k === "country") input.addEventListener("change", () => loadStates(input.value.trim()));
+    return el("div", { class: "field" }, el("label", { for: `x-f-${k}` }, label), input,
+      locked ? el("div", { class: "hint" }, `Set once, to ${current}. Andromeda refuses to change it.`) : null);
+  }));
+  if (o.fields.country) loadStates(o.fields.country);
+}
+
+/** Only the fields that differ from what the account has now. */
+function accountInfoBody() {
+  const out = {};
+  for (const [k] of ACCOUNT_FIELDS) {
+    const input = $(`x-f-${k}`);
+    const value = input.value.trim();
+    if (!input.disabled && value && value !== input.dataset.current) out[k] = value;
+  }
+  return out;
+}
+
+/** Which integration gets the capabilities. Never pre-selected. */
+function renderCapTargets() {
+  const o = X.overview;
+  if (!o) return;
+  const was = document.querySelector("input[name=x-cap-target]:checked");
+  const picked = was ? was.value : null;
+  const options = o.integrations.map((i) => [i.id, `${i.app_name} (id ${i.id})`,
+    `${i.enabled} of ${i.total} enabled for the authority`]);
+  if ($("x-t-integration").checked) {
+    options.push([NEW_INTEGRATION, "The integration being added", "applied just after it is created"]);
+  }
+  if (!options.length) {
+    show($("x-cap-targets"), el("p", { class: "warn" },
+      "The account has no integration. Tick Add an integration, then choose it here."));
+    return;
+  }
+  show($("x-cap-targets"),
+    el("div", { class: "choices" }, options.map(([id, label, hint]) => el("label", {},
+      el("input", { type: "radio", name: "x-cap-target", value: id, checked: id === picked,
+                    onchange: invalidateChanges }),
+      el("span", {}, el("b", {}, label), el("span", { class: "hint" }, `  ${hint}`))))));
+}
+
+async function loadRoles() {
+  const o = X.overview;
+  if (!o) return;
+  X.roles = null;
+  syncRolesTick();
+  const email = $("x-email").value.trim();
+  const { ok, status, data } = await api(`/api/accounts/${o.authority.id}/roles?email=${encodeURIComponent(email)}`);
+  if (X.overview !== o) return;          // another account was looked up meanwhile
+  X.roles = ok ? data : { error: data.error || `Could not read the roles (${status})` };
+  const holder = $("x-roles");
+  if (ok) {
+    show(holder, list(data.roles.map((r) => `${r.name}: ${r.permissions} permission(s)`)),
+      el("div", { class: "hint" }, `read by logging in to the portal as ${data.email}`));
+  } else {
+    show(holder, el("span", { class: "warn" }, X.roles.error));
+  }
+  syncRolesTick();
+}
+
+/** Role & Access needs a portal login as the account; without one it is off, and says why. */
+function syncRolesTick() {
+  const usable = Boolean(X.roles && !X.roles.error);
+  $("x-t-roles").disabled = !usable;
+  if (!usable) { $("x-t-roles").checked = false; $("x-s-roles").hidden = true; }
+  $("x-roles-why").textContent = X.roles === null ? "Checking the portal login…"
+    : X.roles.error ? `Not available for this account: ${X.roles.error}` : "";
+}
+
+function changesBody() {
+  const ticked = (k) => $(`x-t-${k}`).checked;
+  const body = { email: $("x-email").value.trim() || null,
+                 add_integration: ticked("integration"), roles: ticked("roles") };
+  if (ticked("account_info")) body.account_info = accountInfoBody();
+  if (ticked("boundary")) body.boundary_id = S.boundaryId || "";
+  if (ticked("capabilities")) {
+    const target = document.querySelector("input[name=x-cap-target]:checked");
+    body.capabilities_integration = target ? target.value : null;
+    body.capabilities_source = capabilityMode();
+    body.capabilities_capture_id = capabilityMode() === "copy" ? S.captureId : null;
+  }
+  return body;
+}
+
+function sectionNode(s) {
+  const changes = s.changes.length > 12
+    ? el("details", {}, el("summary", {}, `${s.changes.length} changes`), list(s.changes, "plain mono"))
+    : s.changes.length ? list(s.changes, "plain mono") : null;
+  return el("div", { class: `box ${s.refusal ? "bad" : "note"}` },
+    el("b", {}, `${s.refusal ? "✗ " : ""}${s.label}`),
+    s.refusal ? el("p", { style: "margin:4px 0" }, s.refusal) : null,
+    changes || (!s.refusal && s.step !== "revision" ? el("div", { class: "muted" }, "No change needed.") : null),
+    s.skipped.length ? [el("div", { class: "hint" }, "Skipped, and why:"), list(s.skipped)] : null,
+    s.notes.length ? list(s.notes.map((n) => `ℹ ${n}`), "plain hint") : null);
+}
+
+async function doChangePreview() {
+  const o = X.overview;
+  if (!o) return;
+  invalidateChanges();
+  $("x-apply").disabled = true;
+  const out = $("x-preview-out");
+  const body = changesBody();
+  if ($("x-t-capabilities").checked && !body.capabilities_integration) {
+    show(out, el("div", { class: "box bad" }, "Capabilities: choose which integration."));
+    return;
+  }
+  show(out, el("p", { class: "muted" }, "Working out the changes. Nothing is written…"));
+  const { status, data } = await api(`/api/accounts/${o.authority.id}/changes`, { method: "POST", body });
+  if (status === 422) { show(out, el("div", { class: "box bad" }, list(Object.values(data.errors)))); return; }
+  if (status === 400 && data.kind === "session") { needSignIn(out, data.error); return; }
+  if (status !== 200) { show(out, el("div", { class: "box bad" }, data.error || `Preview failed (${status})`)); return; }
+
+  X.runId = data.run_id; X.plan = data.plan;
+  const caps = data.plan.capabilities;
+  show(out, el("div", {},
+    el("h3", {}, `What will change on ${data.plan.authority.name}`),
+    data.plan.sections.map(sectionNode),
+    caps && caps.warning ? el("div", { class: `box ${caps.needs_ack ? "warn" : "note"}` }, caps.warning) : null,
+    data.can_apply ? el("p", {}, "Nothing has been written. Press ", el("b", {}, "Apply"), " to review and confirm.")
+                   : el("div", { class: "box bad" }, "Nothing can be applied while a section is refused (✗). " +
+                       "Resolve it or untick it, then Preview again.")));
+  $("x-apply").disabled = !data.can_apply;
+}
+
+/** The second, explicit confirmation. */
+function showApplyConfirm() {
+  const p = X.plan;
+  if (!p) return;
+  const labels = p.sections.filter((s) => s.step !== "revision").map((s) => s.label);
+  const rev = p.publishes_revision ? el("input", { type: "checkbox", id: "x-ack-revision" }) : null;
+  const cap = p.capabilities && p.capabilities.needs_ack ? el("input", { type: "checkbox", id: "x-ack-caps" }) : null;
+  const go = el("button", { type: "button", class: "primary", onclick: () => doApply(false) }, "Confirm and apply");
+  const sync = () => { go.disabled = Boolean((rev && !rev.checked) || (cap && !cap.checked)); };
+  if (rev) rev.addEventListener("change", sync);
+  if (cap) cap.addEventListener("change", sync);
+  show($("x-confirm"), el("div", { class: "gate" },
+    el("b", {}, `Apply ${labels.length} change${labels.length === 1 ? "" : "s"} to ${p.authority.name}?`),
+    list(labels),
+    rev ? el("label", { style: "font-weight:400;margin-top:8px" }, rev,
+      " I understand adding the jurisdiction publishes an environment-wide revision.") : null,
+    cap ? el("label", { style: "font-weight:400;margin-top:8px" }, cap,
+      " I understand most of the copied capabilities will be skipped.") : null,
+    el("p", { class: "hint" }, "Capabilities and roles are snapshotted before they are written, " +
+      "and can be undone afterwards."),
+    el("div", { class: "actions" }, go,
+      el("button", { type: "button", onclick: () => show($("x-confirm")) }, "Cancel"))));
+  sync();
+}
+
+async function doApply(acknowledgeExpiry) {
+  const runId = X.runId, plan = X.plan;
+  if (!runId) return;
+  const ticked = (id) => Boolean($(id) && $(id).checked);
+  const { status, data } = await api(`/api/runs/${runId}/apply`, { method: "POST", body: {
+    confirm: true, acknowledge_revision: ticked("x-ack-revision"),
+    acknowledge_capabilities: ticked("x-ack-caps"), acknowledge_expiry: acknowledgeExpiry } });
+  const out = $("x-confirm");
+  if (status === 202) {
+    show(out);
+    X.runId = null;
+    $("x-apply").disabled = true;
+    $("x-preview").disabled = true;
+    const keys = new Set(plan.sections.map((s) => s.step));
+    startRun(runId, "change", CHANGE_STEPS.filter((s) => keys.has(s.key)), data.status);
+    openStream();
+    return;
+  }
+  if (status === 409 && data.kind === "expiring") {
+    if (confirm(`The Andromeda sign-in runs out in ${duration(data.seconds_left.andromeda)}. Apply anyway?`)) doApply(true);
+    return;
+  }
+  if (status === 400 && data.kind === "session") { needSignIn(out, data.error); return; }
+  show(out, el("div", { class: "box bad" }, data.error || `Could not apply (${status})`));
+}
+
+function lookAgain(ev) {
+  setMode("existing");
+  const id = (ev && ev.authority && ev.authority.id) || $("x-authority").value;
+  $("x-authority").value = String(id);
+  $("existing").scrollIntoView({ behavior: "smooth" });
+  findExisting(String(id));
+}
+
+/** Resume setup is the existing Resume path, with this account filled in. */
+function resumeSetup() {
+  const o = X.overview;
+  if (!o) return;
+  const email = $("x-email").value.trim();
+  setMode("create");
+  $("resume").hidden = false;
+  $("resume-authority").value = String(o.authority.id);
+  $("resume-email").value = email;
+  $("resume").scrollIntoView({ behavior: "smooth" });
+  findAuthority();
+}
+
 // ---------------------------------------------------------- reload recovery
 async function recover(runId) {
   const { ok, data } = await api(`/api/runs/${runId}`);
   if (!ok) { history.replaceState(null, "", "#"); return; }
-  const steps = data.kind === "new" ? [{ key: "signup", label: "Sign up" }, ...STEPS] : STEPS;
+  let steps = data.kind === "new" ? [{ key: "signup", label: "Sign up" }, ...STEPS] : STEPS;
+  if (data.kind === "change") {
+    const keys = new Set(((data.plan && data.plan.sections) || []).map((s) => s.step));
+    steps = CHANGE_STEPS.filter((s) => keys.has(s.key));
+    setMode("existing");
+    $("x-authority").value = data.authority_id || "";
+  }
   startRun(runId, data.kind, steps, data.status);
   if (data.form && data.form.email) {
     $("gate-email").textContent = data.form.email;
@@ -1122,14 +1557,7 @@ function wire() {
   setInterval(renderSession, 30000);
   setInterval(refreshSession, 5 * 60 * 1000);
 
-  document.querySelectorAll("input[name=bsource]").forEach((r) => r.addEventListener("change", () => {
-    const mode = boundaryMode();
-    $("by-place").hidden = mode !== "place";
-    $("by-file").hidden = mode !== "file";
-    $("by-account").hidden = mode !== "account";
-    setBoundary(null); show($("place-out")); show($("file-out")); show($("bound-out"));
-    $("f-place").value = ""; $("f-file").value = ""; $("bound-source").value = ""; lastQuery = null;
-  }));
+  document.querySelectorAll("input[name=bsource]").forEach((r) => r.addEventListener("change", onBoundarySource));
   $("place-lookup").addEventListener("click", () => lookupPlace($("f-place").value));
   $("f-place").addEventListener("keydown", (e) => { if (e.key === "Enter") lookupPlace($("f-place").value); });
   $("f-place").addEventListener("blur", () => {
@@ -1137,10 +1565,7 @@ function wire() {
     if (q && q !== lastQuery) lookupPlace(q);
   });
   $("f-file").addEventListener("change", (e) => uploadBoundary(e.target.files[0]));
-  document.querySelectorAll("input[name=csource]").forEach((r) => r.addEventListener("change", () => {
-    $("caps-copy").hidden = capabilityMode() !== "copy";
-    setCapture(null); show($("cap-out")); invalidatePreview();
-  }));
+  document.querySelectorAll("input[name=csource]").forEach((r) => r.addEventListener("change", onCapabilitySource));
   $("cap-find").addEventListener("click", () => findCapabilitySource());
   $("bound-find").addEventListener("click", () => findBoundarySource());
   $("bound-source").addEventListener("keydown", (e) => { if (e.key === "Enter") findBoundarySource(); });
@@ -1155,8 +1580,38 @@ function wire() {
   $("gate-clicked").addEventListener("change", updateContinue);
   $("gate-confirm").addEventListener("click", confirmLink);
   $("continue").addEventListener("click", () => doContinue());
-  $("resume-toggle").addEventListener("click", () => { $("resume").hidden = !$("resume").hidden; });
   $("resume-find").addEventListener("click", findAuthority);
+
+  document.querySelectorAll("input[name=mode]").forEach((r) => r.addEventListener("change", () => setMode(mode())));
+  $("x-find").addEventListener("click", () => findExisting());
+  $("x-authority").addEventListener("keydown", (e) => { if (e.key === "Enter") findExisting(); });
+  $("x-email-check").addEventListener("click", () => { invalidateChanges(); loadRoles(); });
+  $("x-email").addEventListener("keydown", (e) => { if (e.key === "Enter") { invalidateChanges(); loadRoles(); } });
+  $("x-resume").addEventListener("click", resumeSetup);
+  for (const k of TICKS) {
+    $(`x-t-${k}`).addEventListener("change", () => {
+      $(`x-s-${k}`).hidden = !$(`x-t-${k}`).checked;
+      if (k === "integration") renderCapTargets();
+      invalidateChanges();
+    });
+  }
+  $("x-preview").addEventListener("click", doChangePreview);
+  $("x-apply").addEventListener("click", showApplyConfirm);
+}
+
+/** Which geometry source is shown; switching clears whatever was chosen. */
+function onBoundarySource() {
+  const m = boundaryMode();
+  $("by-place").hidden = m !== "place";
+  $("by-file").hidden = m !== "file";
+  $("by-account").hidden = m !== "account";
+  setBoundary(null); show($("place-out")); show($("file-out")); show($("bound-out"));
+  $("f-place").value = ""; $("f-file").value = ""; $("bound-source").value = ""; lastQuery = null;
+}
+
+function onCapabilitySource() {
+  $("caps-copy").hidden = capabilityMode() !== "copy";
+  setCapture(null); show($("cap-out")); invalidatePreview();
 }
 
 async function init() {
@@ -1164,6 +1619,7 @@ async function init() {
   refreshSession();
   const { data } = await api("/api/status");
   STEPS = data.steps || [];
+  CHANGE_STEPS = data.change_steps || [];
   showPlaceLookupState(data);
   const match = location.hash.match(/run=([0-9a-f]+)/);
   if (match) recover(match[1]);

@@ -1,7 +1,7 @@
 """Run state held between the two phases, and the one-run-at-a-time lock.
 
 Everything lives in memory. The app is local and single-user; if it is
-restarted mid-way, "Resume an existing account" rebuilds what phase 2 needs
+restarted mid-way, "Resume setup" rebuilds what phase 2 needs
 from the authority itself.
 
 Tokens are never stored here. They are handed to the worker that needs them
@@ -38,7 +38,7 @@ def scrub(text: str) -> str:
 @dataclass
 class Run:
     id: str
-    kind: str                                    # "new" | "resume"
+    kind: str                                    # "new" | "resume" | "change"
     status: str
     form: Dict[str, Any] = field(default_factory=dict)
     boundary_id: Optional[str] = None
@@ -56,6 +56,7 @@ class Run:
     result: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
     snapshots: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    change_plan: Optional[Any] = None            # "change" runs: the previewed ChangePlan
     events: List[Dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: dt.datetime.now().isoformat(timespec="seconds"))
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)

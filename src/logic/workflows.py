@@ -84,8 +84,24 @@ __all__ = [
     "PRIMARY_DISPATCH_TYPE",
     "CONFIGURE_STEPS",
     "AmbiguousIntegrationError",
+    "AccountChanges",
     "AccountIdInUseError",
+    "AccountOverview",
     "AttachResult",
+    "CHANGE_STEPS",
+    "ChangePlan",
+    "ChangeRefusedError",
+    "ChangeResult",
+    "EDITABLE_ACCOUNT_FIELDS",
+    "IntegrationSummary",
+    "NEW_INTEGRATION",
+    "PartialChangeError",
+    "SectionPlan",
+    "StalePlanError",
+    "apply_account_changes",
+    "change_next_action",
+    "describe_account",
+    "plan_account_changes",
     "AuthorityMismatchError",
     "ConfigureError",
     "ConfigureResult",
@@ -1302,3 +1318,632 @@ def plan_roles_restore(
         if not granted and not revoked:
             report.unchanged.append(role.name)
     return report
+
+
+# ------------------------------------------ working account -> changed
+#
+# For an account that already works: show what it has, then change only what
+# the user ticked. Planning is read-only and records each section's refusal
+# instead of raising, so a person sees every problem at once. Applying plans
+# again first and refuses if anything moved since the preview, then runs the
+# ticked steps in CHANGE_STEPS order:
+#
+# * the jurisdiction before capabilities -- alerts need it Active;
+# * an added integration before capabilities, which may target it;
+# * roles last -- the portal lists data sources only once capabilities exist.
+#
+# Integrations are only ever added, never edited. A jurisdiction is only ever
+# added; publishing it is environment-wide, so someone else's work in the
+# batch is refused before anything is created.
+
+
+#: (key, label) for each step a change can run, in the order they run.
+CHANGE_STEPS: tuple[tuple[str, str], ...] = (
+    ("account_info", "Account details"),
+    ("boundary", "Add a jurisdiction"),
+    ("revision", "Publish revision"),
+    ("integration", "Add an integration"),
+    ("capabilities", "Capabilities"),
+    ("roles", "Role & Access"),
+)
+
+#: What "Account details" may change. account_id only while it is empty;
+#: dispatch_type, name and display_name are not offered -- integration names
+#: and Resume both key off the authority name.
+EDITABLE_ACCOUNT_FIELDS: tuple[str, ...] = (
+    "account_id", "country", "state", "contact_name", "contact_email",
+    "contact_phone", "contact_title", "non_emergency_phone", "population",
+    "phone_system", "cad_system", "mapping_system",
+)
+
+#: `AccountChanges.capabilities_integration` value meaning "the one being added".
+NEW_INTEGRATION = "new"
+
+
+@dataclass(frozen=True)
+class IntegrationSummary:
+    integration: Integration
+    total: int
+    enabled: int
+    rsos_enabled: int
+
+
+@dataclass
+class AccountOverview:
+    """What an existing account has. Read-only."""
+
+    authority_id: str
+    authority_name: str
+    organization_id: str
+    record: dict[str, Any]
+    jurisdictions: list[Jurisdiction] = field(default_factory=list)
+    integrations: list[IntegrationSummary] = field(default_factory=list)
+    pending_mine: list[str] = field(default_factory=list)          # jurisdiction ids
+    pending_others: dict[str, str] = field(default_factory=dict)   # id -> name
+
+    @property
+    def account_id_locked(self) -> bool:
+        return bool(self.record.get("account_id"))
+
+
+def _capability_counts(body: Any) -> tuple[int, int, int]:
+    entries = (body.get("capabilities") or []) if isinstance(body, Mapping) else []
+    return (len(entries),
+            sum(1 for e in entries if e.get("authority_enabled")),
+            sum(1 for e in entries if e.get("rsos_enabled")))
+
+
+def describe_account(
+    andromeda: WorkflowClient,
+    authority: str,
+    *,
+    organization_id: str | None = None,
+) -> AccountOverview:
+    """The authority, its jurisdictions, its integrations and their capability
+    counts, and the revision batch. Writes nothing.
+
+    `authority` is a name or numeric id. A shared name is resolved only when
+    exactly one match is in `organization_id`; otherwise AmbiguousAuthorityError.
+    """
+    authority_id = _find_authority_id(andromeda, authority, organization_id,
+                                      attempts=1, delay=0, sleep=time.sleep)
+    record = get_authority(andromeda, authority_id)
+    overview = AccountOverview(
+        authority_id=authority_id,
+        authority_name=str(record.get("name") or record.get("display_name") or authority),
+        organization_id=str(record.get("organization_id") or ""),
+        record=dict(record),
+        jurisdictions=list_jurisdictions(andromeda, authority_id),
+    )
+    for integration in list_integrations(andromeda, authority_id):
+        body = andromeda.get(_capabilities_path(authority_id, integration.id))
+        overview.integrations.append(IntegrationSummary(integration, *_capability_counts(body)))
+
+    pending = get_pending(andromeda)
+    overview.pending_mine = [str(e.get("id")) for e in pending.entries_for(authority_id)]
+    others = [a for a in pending.authority_ids if a != str(authority_id)]
+    overview.pending_others = authority_names(andromeda, others)
+    return overview
+
+
+class StalePlanError(ConfigureError):
+    """The account changed between Preview and Apply."""
+
+    def __init__(self, sections: list[str]):
+        self.sections = list(sections)
+        super().__init__(
+            f"the account changed since Preview ({', '.join(sections)}). Nothing was "
+            f"written. Preview again and check the new diff."
+        )
+
+
+class ChangeRefusedError(ConfigureError):
+    """A ticked section cannot be applied as asked."""
+
+
+@dataclass
+class AccountChanges:
+    """What the user ticked. Unset means "leave it alone"."""
+
+    account_info: dict[str, Any] | None = None     # field -> new value
+    polygon: Mapping[str, Any] | None = None       # add a jurisdiction
+    add_integration: bool = False
+    capabilities_integration: str | None = None    # an integration id, or NEW_INTEGRATION
+    standard: Mapping[CapabilityKey, tuple[bool, bool]] | None = None   # None: packaged set
+    standard_label: str = "the standard sandbox set"
+    roles: bool = False
+
+    @property
+    def steps(self) -> list[str]:
+        ticked = {
+            "account_info": self.account_info is not None,
+            "boundary": self.polygon is not None,
+            "revision": self.polygon is not None,
+            "integration": self.add_integration,
+            "capabilities": self.capabilities_integration is not None,
+            "roles": self.roles,
+        }
+        return [key for key, _ in CHANGE_STEPS if ticked[key]]
+
+
+@dataclass
+class SectionPlan:
+    step: str
+    changes: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    refusal: Exception | None = None
+
+    def lines(self) -> tuple:
+        """What was shown -- compared at Apply to detect a moved account."""
+        return (tuple(self.changes), tuple(self.skipped),
+                str(self.refusal) if self.refusal else None)
+
+
+@dataclass
+class ChangePlan:
+    authority_id: str
+    authority_name: str
+    organization_id: str
+    changes: AccountChanges
+    sections: dict[str, SectionPlan] = field(default_factory=dict)
+    app_name: str | None = None                   # for an added integration
+    account_info: AccountInfoReport | None = None
+    capabilities: CapabilityReport | None = None
+    roles: RoleAccessReport | None = None
+
+    @property
+    def refusals(self) -> dict[str, Exception]:
+        return {k: s.refusal for k, s in self.sections.items() if s.refusal is not None}
+
+    @property
+    def blocked(self) -> bool:
+        return bool(self.refusals)
+
+    def fingerprint(self) -> dict[str, tuple]:
+        return {k: s.lines() for k, s in self.sections.items()}
+
+
+def _unused_app_name(base: str, taken: set[str]) -> str:
+    """`base`, or `base 2`, `base 3`, ... -- the first no integration has."""
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base} {n}" in taken:
+        n += 1
+    return f"{base} {n}"
+
+
+def plan_account_changes(
+    andromeda: WorkflowClient,
+    portal: RoleClient | None,
+    authority_id: str,
+    changes: AccountChanges,
+    *,
+    portal_problem: str | None = None,
+) -> ChangePlan:
+    """Dry-run every ticked section against the account as it is now.
+
+    Never raises for a section's own problem: it is recorded as that section's
+    `refusal`, and `ChangePlan.blocked` says whether Apply may run. `portal` is
+    None when the portal login failed; `portal_problem` says why.
+    """
+    from logic.authorities import UnknownCountryError, UnknownStateError
+    from logic.capabilities import ALERTS_CAPABILITIES
+    from logic.capabilities import plan as plan_flags
+    from logic.integrations import build_app_name
+    from logic.jurisdictions import InvalidGeometryError, JurisdictionError, bbox
+
+    record = get_authority(andromeda, authority_id)
+    plan = ChangePlan(
+        authority_id=str(authority_id),
+        authority_name=str(record.get("name") or record.get("display_name") or authority_id),
+        organization_id=str(record.get("organization_id") or ""),
+        changes=changes,
+    )
+    steps = changes.steps
+
+    # --- account details ---------------------------------------------------
+    if "account_info" in steps:
+        section = plan.sections["account_info"] = SectionPlan("account_info")
+        fields = dict(changes.account_info or {})
+        not_offered = sorted(set(fields) - set(EDITABLE_ACCOUNT_FIELDS))
+        if not_offered:
+            section.refusal = ChangeRefusedError(
+                f"not editable here: {', '.join(not_offered)}")
+        elif not fields:
+            section.refusal = ChangeRefusedError("no account details were given")
+        else:
+            wanted_id = fields.get("account_id")
+            try:
+                if wanted_id and not record.get("account_id"):
+                    try:
+                        clash = find_authority(andromeda, account_id=wanted_id)
+                    except AuthorityNotFoundError:
+                        clash = None
+                    if clash is not None and str(clash.get("id")) != str(authority_id):
+                        raise AccountIdInUseError(wanted_id, clash)
+                report = update_account_info(andromeda, authority_id, dispatch_type=None,
+                                             dry_run=True, **fields)
+            except (AccountIdInUseError, UnknownCountryError, UnknownStateError,
+                    AccountInfoError) as exc:
+                section.refusal = exc
+            else:
+                plan.account_info = report
+                section.changes = [f"{name}: {before!r} -> {after!r}"
+                                   for name, (before, after) in sorted(report.changed.items())]
+                section.skipped = [f"{name}: {reason}"
+                                   for name, reason in sorted(report.skipped.items())]
+                if report.is_noop and not report.skipped:
+                    section.notes.append("already has these values; nothing to write")
+
+    # --- add a jurisdiction ------------------------------------------------
+    if "boundary" in steps:
+        section = plan.sections["boundary"] = SectionPlan("boundary")
+        try:
+            polygon = normalize_geojson(changes.polygon)
+            validate_geojson(polygon)
+        except (InvalidGeometryError, JurisdictionError) as exc:
+            section.refusal = exc
+        else:
+            box = tuple(round(v, 4) for v in bbox(polygon))
+            section.changes.append(
+                f"create a jurisdiction ({len(polygon['features'])} feature(s), "
+                f"bbox {box}), then publish a revision to make it Active")
+            existing = list_jurisdictions(andromeda, authority_id)
+            if existing:
+                listing = ", ".join(f"{j.id} {j.ingress_label}" for j in existing)
+                section.notes.append(
+                    f"the account already has {len(existing)} jurisdiction(s) "
+                    f"({listing}); this adds another and changes none of them")
+            pending = get_pending(andromeda)
+            mine = [str(e.get("id")) for e in pending.entries_for(authority_id)]
+            if mine:
+                section.changes.append(
+                    f"the same revision also publishes this account's waiting "
+                    f"jurisdiction(s) {', '.join(mine)}")
+            others = [a for a in pending.authority_ids if a != str(authority_id)]
+            if others:
+                section.refusal = OtherAuthoritiesPendingError(str(authority_id), others)
+        plan.sections["revision"] = SectionPlan("revision", notes=[
+            "publishing a revision is environment-wide: it activates every "
+            "authority's pending jurisdiction changes"])
+
+    # --- add an integration ------------------------------------------------
+    if "integration" in steps:
+        section = plan.sections["integration"] = SectionPlan("integration")
+        taken = {i.app_name for i in list_integrations(andromeda, authority_id)}
+        base = build_app_name(plan.authority_name)
+        plan.app_name = _unused_app_name(base, taken)
+        section.changes.append(f"create integration {plan.app_name!r} ({DEFAULT_PRODUCT})")
+        if plan.app_name != base:
+            section.notes.append(f"{base!r} already exists, so this one is numbered")
+        if any(name.startswith(_generated_name_prefix(plan.authority_name)) for name in taken):
+            section.notes.append(
+                "the account will then have more than one generated integration, so "
+                "Resume setup will refuse to guess which one to configure")
+        section.notes.append("its consumer secret is shown once, when it is created")
+
+    # --- capabilities ------------------------------------------------------
+    if "capabilities" in steps:
+        section = plan.sections["capabilities"] = SectionPlan("capabilities")
+        target = str(changes.capabilities_integration)
+        standard = changes.standard if changes.standard is not None else load_standard()
+        section.notes.append(f"source: {changes.standard_label}")
+        if target == NEW_INTEGRATION:
+            if not changes.add_integration:
+                section.refusal = ChangeRefusedError(
+                    "capabilities are for the new integration, but adding one is not ticked")
+            else:
+                section.changes.append(
+                    f"apply {len(standard)} capability flag(s) to {plan.app_name!r} once "
+                    f"it exists -- its catalog cannot be read before then")
+        else:
+            integrations = {i.id: i for i in list_integrations(andromeda, authority_id)}
+            if target not in integrations:
+                section.refusal = ChangeRefusedError(
+                    f"authority {authority_id} has no integration {target}")
+            else:
+                live = andromeda.get(_capabilities_path(authority_id, target))
+                _, report = plan_flags(live, standard, integration_id=target)
+                plan.capabilities = report
+                section.changes = [str(c) for c in report.changed]
+                if report.is_noop:
+                    section.notes.append(f"{integrations[target]} already matches")
+                alerts = {CapabilityKey(n, c) for n, c in ALERTS_CAPABILITIES}
+                in_play = [c for c in report.changed if c.key in alerts]
+                if in_play:
+                    section.notes.append(
+                        f"{len(in_play)} of these are alerts capabilities; if the "
+                        f"jurisdiction overlaps one that already has them, Andromeda "
+                        f"refuses them and they are left as they are")
+                if report.missing_from_target:
+                    section.skipped.append(
+                        f"{len(report.missing_from_target)} in the set but not offered by "
+                        f"this integration: "
+                        f"{', '.join(str(k) for k in report.missing_from_target)}")
+                if report.missing_from_standard:
+                    section.skipped.append(
+                        f"{len(report.missing_from_standard)} on the integration but not "
+                        f"in the set, left unchanged")
+
+    # --- role & access -----------------------------------------------------
+    if "roles" in steps:
+        section = plan.sections["roles"] = SectionPlan("roles")
+        if portal is None:
+            section.refusal = ChangeRefusedError(
+                portal_problem or "there is no portal login for this account")
+        elif not plan.organization_id:
+            section.refusal = ChangeRefusedError(
+                f"authority {authority_id} has no organization_id, so its portal "
+                f"roles cannot be found")
+        else:
+            report = enable_all_data_sources(portal, plan.organization_id, dry_run=True)
+            plan.roles = report
+            section.changes = (
+                [f"{r}: +{', '.join(n)}" for r, n in sorted(report.granted.items())]
+                + [f"{r}: -{', '.join(n)}" for r, n in sorted(report.revoked.items())])
+            if report.is_noop:
+                section.notes.append("roles already hold every data source")
+            if report.revoked:
+                if "capabilities" in steps:
+                    section.notes.append(
+                        "these removals may vanish once capabilities are written; roles "
+                        "are checked again just before writing, and any removal then "
+                        "is refused")
+                else:
+                    section.refusal = UnexpectedRevocationError(report)
+            elif "capabilities" in steps:
+                section.notes.append("checked again after capabilities, just before writing")
+
+    return plan
+
+
+@dataclass
+class ChangeResult:
+    authority_id: str
+    authority_name: str
+    organization_id: str
+    planned: list[str]
+    account_info: AccountInfoReport | None = None
+    jurisdiction: Jurisdiction | None = None
+    revision: RevisionResult | None = None
+    integration: Integration | None = None
+    capabilities: CapabilityReport | None = None
+    roles: RoleAccessReport | None = None
+    snapshots: dict[str, str] = field(default_factory=dict)
+    steps: list[StepOutcome] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def status_of(self, step: str) -> str:
+        for outcome in reversed(self.steps):
+            if outcome.step == step and outcome.status != "note":
+                return outcome.status
+        return "not run"
+
+    @property
+    def completed(self) -> list[str]:
+        return [k for k in self.planned if self.status_of(k) in _FINISHED]
+
+    @property
+    def not_done(self) -> list[str]:
+        return [k for k in self.planned if self.status_of(k) not in _FINISHED]
+
+    def existing(self) -> list[str]:
+        """What this change really wrote, in words."""
+        out = []
+        if self.account_info and self.account_info.applied:
+            out.append(f"account details updated "
+                       f"({', '.join(sorted(self.account_info.changed))})")
+        if self.jurisdiction and self.jurisdiction.id:
+            out.append(f"jurisdiction {self.jurisdiction.id} added "
+                       f"({self.jurisdiction.ingress_label})")
+        if self.revision:
+            out.append(f"revision {self.revision.revision_number} published")
+        if self.integration and self.integration.id:
+            out.append(f"integration {self.integration} added")
+        if self.capabilities and self.capabilities.applied:
+            out.append(f"{len(self.capabilities.changed)} capability change(s) applied")
+        if self.roles and self.roles.applied:
+            out.append("portal roles updated")
+        return out
+
+
+class PartialChangeError(PartialConfigureError):
+    """`apply_account_changes` stopped. Carries a ChangeResult of what happened."""
+
+
+def change_next_action(error: PartialChangeError) -> str:
+    """What a person should do about `error`, in one or two sentences."""
+    added = [k for k in ("boundary", "integration") if k in error.result.completed]
+    untick = ""
+    if added:
+        what = " and ".join({"boundary": "the jurisdiction",
+                             "integration": "the integration"}[k] for k in added)
+        untick = (f" Untick {what} before previewing again: it was added, and "
+                  f"ticking it again would add a second one.")
+    for cause in _cause_chain(error.cause):
+        if isinstance(cause, StalePlanError):
+            return ("The account changed since Preview. Nothing was written. Press "
+                    "Preview again and check the new diff.")
+        if isinstance(cause, (PartialActivationError, NotInPendingBatchError)):
+            return (f"Jurisdiction {cause.jurisdiction.id} was created but not published. "
+                    f"It is waiting in the environment-wide batch, so the next revision "
+                    f"anyone publishes will activate it. Do not add it again; tell the "
+                    f"team and check it in Andromeda.")
+        if isinstance(cause, OtherAuthoritiesPendingError):
+            return ("Publishing a revision is environment-wide, and the pending revision "
+                    "holds other authorities' changes. Nothing was created or published. "
+                    "Ask the team who owns those changes, then preview again.")
+        if isinstance(cause, UnexpectedRevocationError):
+            return ("The roles were not changed. Applying would remove permissions the "
+                    "portal's catalog does not list; check Admin -> Role and Access in "
+                    "the portal." + untick)
+        if isinstance(cause, CapabilityWriteError):
+            return ("The server did not store the capabilities as requested. Undo them "
+                    "from the snapshot, then check the integration in Andromeda." + untick)
+    return "Fix the cause shown, then preview again." + untick
+
+
+def apply_account_changes(
+    andromeda: WorkflowClient,
+    portal: RoleClient | None,
+    plan: ChangePlan,
+    *,
+    portal_problem: str | None = None,
+    save_snapshot: Callable[[str, Mapping[str, Any]], str | None] | None = None,
+    on_step: Callable[[StepOutcome], None] | None = None,
+    confirm_attempts: int = 5,
+    confirm_delay: float = 2.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ChangeResult:
+    """Apply a previewed ChangePlan: only the ticked steps, in CHANGE_STEPS order.
+
+    Refuses, writing nothing, when the plan has a refused section, or when
+    planning again gives anything different from what was previewed.
+    Capabilities and roles are passed to `save_snapshot(label, body)` before
+    each is written.
+
+    Raises
+    ------
+    PartialChangeError
+        A step failed or refused. Carries a ChangeResult saying what was
+        written; `change_next_action(error)` says what to do.
+    """
+    changes = plan.changes
+    authority_id = plan.authority_id
+    result = ChangeResult(authority_id=authority_id, authority_name=plan.authority_name,
+                          organization_id=plan.organization_id, planned=changes.steps)
+
+    def record(step: str, status: str, detail: str = "") -> None:
+        outcome = StepOutcome(step, status, detail)
+        result.steps.append(outcome)
+        if status == "note":
+            result.notes.append(detail)
+        if on_step is not None:
+            on_step(outcome)
+
+    def fail(step: str, exc: Exception) -> PartialChangeError:
+        record(step, "failed", str(root_cause(exc)))
+        return PartialChangeError(result, step, exc)
+
+    def snapshot(label: str, body: Mapping[str, Any]) -> None:
+        if save_snapshot is None:
+            return
+        where = save_snapshot(label, body)
+        if where:
+            result.snapshots[label] = where
+
+    # --- look again before writing anything ------------------------------
+    if not changes.steps:
+        raise PartialChangeError(result, "account_info",
+                                 ChangeRefusedError("nothing was ticked"))
+    if plan.blocked:
+        step, refusal = next(iter(plan.refusals.items()))
+        raise fail(step, refusal)
+    try:
+        again = plan_account_changes(andromeda, portal, authority_id, changes,
+                                     portal_problem=portal_problem)
+    except Exception as exc:
+        raise fail(changes.steps[0], exc) from exc
+    before, now = plan.fingerprint(), again.fingerprint()
+    moved = [k for k in changes.steps if before.get(k) != now.get(k)]
+    if moved:
+        raise fail(moved[0], StalePlanError(moved))
+
+    # --- account details ---------------------------------------------------
+    if "account_info" in changes.steps:
+        record("account_info", "running")
+        try:
+            report = update_account_info(andromeda, authority_id, dispatch_type=None,
+                                         **dict(changes.account_info or {}))
+        except Exception as exc:
+            raise fail("account_info", exc) from exc
+        result.account_info = report
+        for name, reason in sorted(report.skipped.items()):
+            record("account_info", "note", f"{name} left unchanged: {reason}")
+        record("account_info", "skipped" if report.is_noop else "done",
+               "already up to date" if report.is_noop else report.summary())
+
+    # --- add a jurisdiction, publish it ------------------------------------
+    if "boundary" in changes.steps:
+        record("boundary", "running", "creating the jurisdiction, then publishing it")
+        try:
+            attached = attach_and_activate(andromeda, authority_id, polygon=changes.polygon)
+        except (PartialActivationError, NotInPendingBatchError) as exc:
+            result.jurisdiction = exc.jurisdiction
+            record("boundary", "done", f"jurisdiction {exc.jurisdiction.id} created")
+            raise fail("revision", exc) from exc
+        except Exception as exc:
+            raise fail("boundary", exc) from exc
+        result.jurisdiction = attached.jurisdiction
+        result.revision = attached.revision
+        record("boundary", "done", f"jurisdiction {attached.jurisdiction.id} created")
+        try:
+            confirmed = confirm_jurisdiction_active(
+                andromeda, authority_id, attached.jurisdiction.id,
+                attempts=confirm_attempts, delay=confirm_delay, sleep=sleep)
+        except Exception as exc:
+            raise fail("revision", exc) from exc
+        if confirmed is not None:
+            result.jurisdiction = confirmed
+        record("revision", "done", f"revision {attached.revision.revision_number} published")
+        if confirmed is None or confirmed.ingress_status != int(IngressStatus.ACTIVE):
+            label = confirmed.ingress_label if confirmed else "not listed"
+            record("revision", "note",
+                   f"jurisdiction {attached.jurisdiction.id} is still {label}; alerts "
+                   f"capabilities depend on it being Active and may be skipped")
+
+    # --- add an integration ------------------------------------------------
+    if "integration" in changes.steps:
+        record("integration", "running")
+        try:
+            integration = create_integration(
+                andromeda, authority_id, app_name=plan.app_name, product=DEFAULT_PRODUCT,
+                authority_name=plan.authority_name, if_exists=ExistsPolicy.ERROR)
+        except Exception as exc:
+            raise fail("integration", exc) from exc
+        result.integration = integration
+        record("integration", "done", f"created {integration}")
+
+    # --- capabilities ------------------------------------------------------
+    if "capabilities" in changes.steps:
+        target = str(changes.capabilities_integration)
+        if target == NEW_INTEGRATION:
+            target = result.integration.id
+        record("capabilities", "running")
+        try:
+            live = andromeda.get(_capabilities_path(authority_id, target))
+            snapshot(f"capabilities-{target}", live)
+            caps = apply_standard_capabilities(andromeda, authority_id, target,
+                                               standard=changes.standard)
+        except Exception as exc:
+            raise fail("capabilities", exc) from exc
+        result.capabilities = caps
+        record("capabilities", "done" if caps.applied else "skipped", caps.summary())
+        if caps.alerts_skipped:
+            record("capabilities", "note",
+                   f"{len(caps.alerts_skipped)} alerts capabilities left off -- the "
+                   f"jurisdiction overlaps one that already has them: "
+                   f"{', '.join(str(k) for k in caps.alerts_skipped)}")
+
+    # --- role & access -----------------------------------------------------
+    if "roles" in changes.steps:
+        org = plan.organization_id
+        record("roles", "running")
+        try:
+            # planned again now: capabilities may have changed the catalog
+            planned_roles = enable_all_data_sources(portal, org, dry_run=True)
+            if planned_roles.revoked:
+                raise UnexpectedRevocationError(planned_roles)
+            if planned_roles.is_noop:
+                result.roles = planned_roles
+            else:
+                snapshot(f"roles-{org}", snapshot_roles(portal, org))
+                result.roles = enable_all_data_sources(portal, org)
+        except Exception as exc:
+            raise fail("roles", exc) from exc
+        record("roles", "done" if result.roles.applied else "skipped", result.roles.summary())
+
+    log.info("account changed: %s", "; ".join(result.existing()) or "nothing to write")
+    return result

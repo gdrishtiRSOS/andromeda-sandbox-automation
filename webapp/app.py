@@ -10,6 +10,10 @@ lives in the package, where the CLI and the tests use it too.
     Gate      POST /api/runs/{id}/confirm        (optional: paste the link)
     Phase 2   POST /api/runs/{id}/continue       -> workflows.configure_account
     Progress  GET  /api/runs/{id}/events         (Server-Sent Events)
+    Existing  GET  /api/accounts?authority=      -> workflows.describe_account
+              GET  /api/accounts/{id}/roles      (logs in as the account)
+              POST /api/accounts/{id}/changes    -> workflows.plan_account_changes
+              POST /api/runs/{id}/apply          -> workflows.apply_account_changes
     Sign-in   GET  /api/session                  (who, for how long)
               POST /api/session/sign-in          -> browser_auth.sign_in
               GET  /api/session/sign-in/{id}/events
@@ -88,7 +92,16 @@ from logic.signup import (
 )
 from logic.tokens import decode_token
 from logic.workflows import (
+    CHANGE_STEPS,
     CONFIGURE_STEPS,
+    EDITABLE_ACCOUNT_FIELDS,
+    NEW_INTEGRATION,
+    AccountChanges,
+    PartialChangeError,
+    apply_account_changes,
+    change_next_action,
+    describe_account,
+    plan_account_changes,
     PartialConfigureError,
     authority_names,
     check_new_account,
@@ -181,6 +194,24 @@ class ResumeIn(BaseModel):
     country: Optional[str] = None
     state: Optional[str] = None
     capabilities_capture_id: Optional[str] = None
+
+
+class ChangesIn(BaseModel):
+    email: Optional[str] = None                   # the account, for its roles
+    account_info: Optional[Dict[str, Any]] = None # ticked: field -> value; blanks dropped
+    boundary_id: Optional[str] = None             # ticked: add this jurisdiction
+    add_integration: bool = False
+    capabilities_integration: Optional[str] = None   # an integration id, or "new"
+    capabilities_source: str = "default"             # "default" | "copy"
+    capabilities_capture_id: Optional[str] = None    # the copied set, when "copy"
+    roles: bool = False
+
+
+class ApplyIn(BaseModel):
+    confirm: bool = False
+    acknowledge_revision: bool = False
+    acknowledge_capabilities: bool = False
+    acknowledge_expiry: bool = False
 
 
 class RestoreIn(BaseModel):
@@ -357,6 +388,51 @@ def _step_labels(keys: List[str]) -> List[str]:
     return [labels.get(k, k) for k in keys]
 
 
+def _overview_payload(overview) -> Dict[str, Any]:
+    record = overview.record
+    attributes = record.get("attributes") or {}
+    return {
+        "authority": {"id": overview.authority_id, "name": overview.authority_name,
+                      "organization_id": overview.organization_id,
+                      "account_id": record.get("account_id")},
+        "fields": {name: record.get(name) if name == "account_id" else attributes.get(name)
+                   for name in EDITABLE_ACCOUNT_FIELDS},
+        "account_id_locked": overview.account_id_locked,
+        "email": _contact_email(record),
+        "jurisdictions": [_jurisdiction_choice(j) for j in overview.jurisdictions],
+        "integrations": [{"id": s.integration.id, "app_name": s.integration.app_name,
+                          "product": s.integration.product, "total": s.total,
+                          "enabled": s.enabled, "rsos_enabled": s.rsos_enabled}
+                         for s in overview.integrations],
+        "pending": {"mine": overview.pending_mine, "others": overview.pending_others},
+    }
+
+
+def _change_result_payload(result) -> Dict[str, Any]:
+    integ, caps, info = result.integration, result.capabilities, result.account_info
+    return {
+        "authority": {"id": result.authority_id, "name": result.authority_name,
+                      "organization_id": result.organization_id},
+        "jurisdiction": ({"id": result.jurisdiction.id,
+                          "status": result.jurisdiction.ingress_label}
+                         if result.jurisdiction and result.jurisdiction.id else None),
+        "revision": result.revision.revision_number if result.revision else None,
+        "integration": ({"id": integ.id, "app_name": integ.app_name,
+                         "consumer_key": integ.consumer_key,
+                         "consumer_secret": integ.consumer_secret}
+                        if integ and integ.id else None),
+        "capabilities": ({"changed": len(caps.changed), "applied": caps.applied,
+                          "alerts_skipped": [str(k) for k in caps.alerts_skipped]}
+                         if caps else None),
+        "roles": result.roles.summary() if result.roles else None,
+        "account_info": ({"changed": {k: list(v) for k, v in info.changed.items()},
+                          "skipped": dict(info.skipped)} if info else None),
+        "notes": list(result.notes),
+        "existing": result.existing(),
+        "snapshots": sorted({label.partition("-")[0] for label in result.snapshots}),
+    }
+
+
 # --------------------------------------------------------------------- app
 
 
@@ -498,7 +574,8 @@ def create_app(
     @app.exception_handler(_NotFound)
     async def _no_such_run(request: Request, exc: _NotFound):
         return _error(404, error=f"no run {exc.args[0]}; the app may have been "
-                                 f"restarted -- use Resume an existing account")
+                                 f"restarted -- choose Work on an existing account, "
+                                 f"look it up and press Resume setup")
 
     # ------------------------------------------------------------- page
 
@@ -511,7 +588,8 @@ def create_app(
     def status():
         return {"active_run": runs.active, "place_lookup": places.state,
                 "place_problem": places.problem,
-                "steps": [{"key": k, "label": v} for k, v in CONFIGURE_STEPS]}
+                "steps": [{"key": k, "label": v} for k, v in CONFIGURE_STEPS],
+                "change_steps": [{"key": k, "label": v} for k, v in CHANGE_STEPS]}
 
     # ---------------------------------------------------------- sign-in
 
@@ -1015,21 +1093,16 @@ def create_app(
         workers.submit(_phase2, run, token, session.token)
         return {"status": run.status, "portal_login": _session_report(session, email)}
 
-    def _phase2(run: Run, andromeda_token: str, portal_token: str) -> None:
-        andromeda = andromeda_client(andromeda_token)
-        portal = portal_client(portal_token)
-        del andromeda_token, portal_token
-
-        boundary = boundaries.get(run.boundary_id or "")
-        capture = captures.get(run.capture_id) if run.capture_id else None
-
+    def step_forwarder(run: Run) -> Callable[[Any], None]:
         def on_step(outcome) -> None:
             if outcome.status == "note":
                 run.emit("note", step=outcome.step, message=outcome.detail)
             else:
                 run.emit("step", step=outcome.step, status=outcome.status,
                          detail=outcome.detail)
+        return on_step
 
+    def snapshot_saver(run: Run) -> Callable[[str, Any], str]:
         def save_snapshot(label: str, body) -> str:
             snapshot_dir.mkdir(parents=True, exist_ok=True)
             path = snapshot_dir / _snapshot_filename(label)
@@ -1038,6 +1111,16 @@ def create_app(
             run.emit("note", step=label.partition("-")[0],
                      message=f"Snapshot saved before writing: {path.name}")
             return str(path)
+        return save_snapshot
+
+    def _phase2(run: Run, andromeda_token: str, portal_token: str) -> None:
+        andromeda = andromeda_client(andromeda_token)
+        portal = portal_client(portal_token)
+        del andromeda_token, portal_token
+
+        boundary = boundaries.get(run.boundary_id or "")
+        capture = captures.get(run.capture_id) if run.capture_id else None
+        on_step, save_snapshot = step_forwarder(run), snapshot_saver(run)
 
         try:
             standard = load_standard(capture["body"]) if capture else None
@@ -1149,6 +1232,251 @@ def create_app(
             "id": record.get("id"), "name": record.get("name"),
             "account_id": record.get("account_id"),
             "organization_id": record.get("organization_id")}}
+
+    # ------------------------------------------- work on an existing account
+    #
+    # Show what the account has, preview only what was ticked, then apply it
+    # after a second, explicit confirmation. Every refusal is the workflow's.
+
+    def pending_names(client, exc) -> str:
+        names = authority_names(client, exc.others)
+        return ("Refused: publishing the revision would also publish pending work for "
+                + ", ".join(f"{n} (id {i})" for i, n in names.items())
+                + ". Ask them before adding a jurisdiction.")
+
+    @app.get("/api/accounts")
+    def account_overview(authority: str):
+        token, refused = andromeda_token("Working on an existing account needs Andromeda.")
+        if refused:
+            return refused
+        client = andromeda_client(token)
+        record = resolve_authority(client, authority)
+        if isinstance(record, JSONResponse):
+            return record
+        try:
+            overview = describe_account(client, str(record.get("id")))
+        except Exception as exc:
+            return _error(502, error=_describe_api_error(exc, "Andromeda"))
+        return _overview_payload(overview)
+
+    @app.get("/api/accounts/{authority_id}/roles")
+    def account_roles(authority_id: str, email: str = ""):
+        token, refused = andromeda_token("Working on an existing account needs Andromeda.")
+        if refused:
+            return refused
+        try:
+            record = get_authority(andromeda_client(token), authority_id)
+        except Exception as exc:
+            return _error(502, error=_describe_api_error(exc, "Andromeda"))
+        org = str(record.get("organization_id") or "")
+        email = _clean(email) or _contact_email(record)
+        try:
+            session = portal_login(email)
+        except LoginFailed as exc:
+            return _error(400, kind="login", email=email, error=str(exc))
+        try:
+            roles = list_roles(portal_client(session.token), org)
+        except Exception as exc:
+            return _error(400, kind="login", email=email, error=(
+                f"Logged in as {email}, but that login cannot read the roles of "
+                f"organization {org}: {_describe_api_error(exc, 'the portal')}."))
+        return {"email": email, "portal_login": _session_report(session, email),
+                "roles": [{"id": r.id, "name": r.name, "permissions": len(r.permissions)}
+                          for r in roles]}
+
+    @app.post("/api/accounts/{authority_id}/changes")
+    def preview_changes(authority_id: str, body: ChangesIn):
+        token, refused = andromeda_token("Working on an existing account needs Andromeda.")
+        if refused:
+            return refused
+        errors: Dict[str, str] = {}
+
+        account_info = None
+        if body.account_info is not None:
+            account_info = {k: v.strip() if isinstance(v, str) else v
+                            for k, v in body.account_info.items()}
+            account_info = {k: v for k, v in account_info.items() if v not in (None, "")}
+            population = account_info.get("population")
+            if isinstance(population, str):
+                if population.isdigit():
+                    account_info["population"] = int(population)
+                else:
+                    errors["account_info"] = "population must be a whole number"
+            if not account_info:
+                errors["account_info"] = "fill in at least one field to change"
+
+        boundary = None
+        if body.boundary_id is not None:
+            boundary = boundaries.get(body.boundary_id)
+            if boundary is None:
+                errors["boundary"] = ("look up a place, upload a .geojson file, or copy "
+                                      "another account's boundary")
+
+        target = _clean(body.capabilities_integration)
+        capture_id = _clean(body.capabilities_capture_id)
+        capture, capabilities = None, None
+        standard, label = None, "the standard sandbox set"
+        if target:
+            capture, capabilities = capability_choice(body.capabilities_source, capture_id)
+            if isinstance(capabilities, str):
+                errors["capabilities"] = capabilities
+            elif capture:
+                standard = load_standard(capture["body"])
+                label = (f"copied from {capture['authority']['name']} (id "
+                         f"{capture['authority']['id']}), integration "
+                         f"{capture['integration']['app_name']!r}, read at "
+                         f"{capture['read_at']}")
+        if errors:
+            return _error(422, errors=errors)
+
+        changes = AccountChanges(
+            account_info=account_info,
+            polygon=boundary["polygon"] if boundary else None,
+            add_integration=body.add_integration,
+            capabilities_integration=target,
+            standard=standard, standard_label=label,
+            roles=body.roles,
+        )
+        if not changes.steps:
+            return _error(422, errors={"changes": "tick at least one thing to change"})
+
+        client = andromeda_client(token)
+        try:
+            record = get_authority(client, authority_id)
+        except Exception as exc:
+            return _error(502, error=_describe_api_error(exc, "Andromeda"))
+        email = _clean(body.email) or _contact_email(record)
+        portal, problem = None, None
+        if body.roles:
+            try:
+                portal = portal_client(portal_login(email).token)
+            except LoginFailed as exc:
+                problem = str(exc)
+
+        try:
+            plan = plan_account_changes(client, portal, authority_id, changes,
+                                        portal_problem=problem)
+        except Exception as exc:
+            return _error(502, error=_describe_api_error(exc, "Andromeda"))
+
+        labels = dict(CHANGE_STEPS)
+        sections = []
+        for key, section in plan.sections.items():
+            refusal = str(section.refusal) if section.refusal is not None else None
+            if isinstance(section.refusal, OtherAuthoritiesPendingError):
+                refusal = pending_names(client, section.refusal)
+            sections.append({"step": key, "label": labels[key], "changes": section.changes,
+                             "skipped": section.skipped, "notes": section.notes,
+                             "refusal": refusal})
+        payload = {
+            "authority": {"id": plan.authority_id, "name": plan.authority_name,
+                          "organization_id": plan.organization_id},
+            "sections": sections,
+            "app_name": plan.app_name,
+            "publishes_revision": "boundary" in changes.steps,
+            "capabilities": capabilities if capture else None,
+        }
+        run = runs.new("change", "previewed", form={"email": email},
+                       authority=plan.authority_name, authority_id=plan.authority_id,
+                       organization_id=plan.organization_id or None,
+                       boundary_id=body.boundary_id if boundary else None,
+                       boundary=boundary["summary"] if boundary else None,
+                       capture_id=capture_id if capture else None,
+                       capabilities=capabilities if capture else None,
+                       plan=payload, blocked=plan.blocked)
+        run.change_plan = plan
+        return {"run_id": run.id, "plan": payload, "can_apply": not plan.blocked}
+
+    @app.post("/api/runs/{run_id}/apply", status_code=202)
+    def apply_changes(run_id: str, body: ApplyIn):
+        run = get_run(run_id)
+        if run.kind != "change" or run.status != "previewed":
+            return _error(409, error=f"this run is {run.status}; preview the changes again")
+        plan = run.change_plan
+        if plan.blocked:
+            return _error(409, kind="refused", error=(
+                "Preview refused at least one section. Resolve it, then preview again."))
+        if not body.confirm:
+            return _error(409, kind="confirm",
+                          error="Confirm the changes shown in the preview first.")
+        if "boundary" in plan.changes.steps and not body.acknowledge_revision:
+            return _error(409, kind="revision", error=(
+                "Adding a jurisdiction publishes a revision, and publishing is "
+                "environment-wide. Tick the box to confirm."))
+        if (run.capabilities or {}).get("needs_ack") and not body.acknowledge_capabilities:
+            return _error(409, kind="capabilities", error=run.capabilities["warning"])
+
+        token, refused = andromeda_token()
+        if refused:
+            return refused
+        try:
+            list_countries(andromeda_client(token))
+        except Exception as exc:
+            return _error(400, kind="session", state="failed",
+                          error=_describe_api_error(exc, "Andromeda"))
+        report = _token_report(token)
+        if report["expiring"] and not body.acknowledge_expiry:
+            return _error(409, kind="expiring",
+                          seconds_left={"andromeda": report["seconds_left"]})
+
+        portal_token = None
+        if plan.changes.roles:
+            try:
+                portal_token = portal_login(run.form.get("email")).token
+            except LoginFailed as exc:
+                return _error(400, kind="login", email=run.form.get("email"),
+                              error=str(exc))
+
+        try:
+            runs.start(run)
+        except RunBusyError as exc:
+            return _error(409, error=str(exc), active_run=exc.active)
+        run.set_status("applying")
+        workers.submit(_apply_changes, run, token, portal_token)
+        return {"status": run.status}
+
+    def _apply_changes(run: Run, andromeda_token: str, portal_token: Optional[str]) -> None:
+        andromeda = andromeda_client(andromeda_token)
+        portal = portal_client(portal_token) if portal_token else None
+        del andromeda_token, portal_token
+        try:
+            with capture_logs(run):
+                result = apply_account_changes(
+                    andromeda, portal, run.change_plan,
+                    save_snapshot=snapshot_saver(run), on_step=step_forwarder(run),
+                    sleep=sleep)
+            run.result = _change_result_payload(result)
+            run.emit("done", **run.result)
+            run.set_status("done")
+        except PartialChangeError as err:
+            cause = root_cause(err)
+            labels = dict(CHANGE_STEPS)
+            run.error = {
+                "step": err.failed_step, "refused": err.refused, "message": str(cause),
+                "exists": err.result.existing(),
+                "not_done": [labels[k] for k in err.result.not_done],
+                "advice": change_next_action(err),
+                "partial": {"integration": _change_result_payload(err.result)["integration"]},
+                "snapshots": _change_result_payload(err.result)["snapshots"],
+            }
+            if isinstance(cause, AuthError):
+                run.error["advice"] = ("A sign-in was rejected -- it has probably expired. "
+                                       "Sign in again at the top of the page, then "
+                                       "preview again.")
+            if isinstance(cause, OtherAuthoritiesPendingError):
+                run.error["message"] = pending_names(andromeda, cause)
+            run.emit("failed", **run.error)
+            run.set_status("failed")
+        except Exception as exc:  # a bug, not a refusal -- say so plainly
+            log.exception("applying changes failed unexpectedly")
+            run.error = {"step": None, "refused": False, "message": str(exc),
+                         "exists": [], "not_done": [], "advice": (
+                             "Unexpected error. Look the account up again to see what "
+                             "it has now, then preview again.")}
+            run.emit("failed", **run.error)
+            run.set_status("failed")
+        finally:
+            runs.finish()
 
     # ------------------------------------------------------------- undo
 
